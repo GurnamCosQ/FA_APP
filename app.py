@@ -11,6 +11,12 @@ from zoneinfo import ZoneInfo
 # Planetary Edge Finder (Correct bifurcation)
 #   FAST planets -> Level-1 overextension events -> reversion success
 #   SLOW planets (Jupiter/Saturn/Rahu/Ketu) -> EMA200 regime -> trend bias
+#
+# Updates in this version:
+# - Occurrence charts zoom-out context (1M/3M/6M/1Y/custom) around the placement period
+# - Each occurrence chart highlights the actual placement window as a shaded region
+# - Each occurrence chart includes a compact "other-planet legend" summarizing what other planets did
+#   during that placement period (top values + coverage)
 # ============================================================
 
 # -------------------- Page / Style --------------------
@@ -37,6 +43,15 @@ st.markdown(
 .bg-yellow{ background: #f59e0b; }
 .bg-red   { background: #ef4444; }
 .smallmuted { color: #6b7280; font-size: 13px; }
+.legendbox {
+    border: 1px solid #e5e7eb;
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin-top: 8px;
+    background: #ffffff;
+}
+.legendtitle { font-weight: 700; margin-bottom: 6px; }
+.legenditem { margin: 2px 0; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -144,6 +159,51 @@ def contiguous_blocks(mask: pd.Series) -> list[tuple[int,int]]:
             prev = i
     blocks.append((start, prev))
     return blocks
+
+def context_days_from_mode(mode: str, custom_days: int) -> int:
+    if mode == "None":
+        return 0
+    if mode.startswith("1M"):
+        return 30
+    if mode.startswith("3M"):
+        return 90
+    if mode.startswith("6M"):
+        return 180
+    if mode.startswith("1Y"):
+        return 365
+    return int(custom_days)
+
+def summarize_other_planets(df_period: pd.DataFrame, features: list[str], top_k: int = 2) -> dict:
+    """
+    Summarize what other planets were doing during the actual placement period.
+    For each feature:
+      - list the top_k most common values with % coverage.
+    """
+    out = {}
+    for feat in features:
+        if feat not in df_period.columns:
+            continue
+        s = df_period[feat].dropna()
+        if len(s) == 0:
+            continue
+        vc = s.value_counts(dropna=True)
+        total = vc.sum()
+        items = []
+        for val, cnt in vc.head(top_k).items():
+            pct = (cnt / total) * 100.0
+            items.append((val, pct))
+        out[feat] = items
+    return out
+
+def render_legend_box(summary: dict):
+    if not summary:
+        return
+    lines = []
+    for feat, items in summary.items():
+        parts = [f"{val} ({pct:.0f}%)" for val, pct in items]
+        lines.append(f"<div class='legenditem'><b>{feat}</b>: " + ", ".join(parts) + "</div>")
+    html = "<div class='legendbox'><div class='legendtitle'>Other planets during this placement</div>" + "".join(lines) + "</div>"
+    st.markdown(html, unsafe_allow_html=True)
 
 # -------------------- Data fetch / normalization --------------------
 @st.cache_data(show_spinner=False)
@@ -311,7 +371,7 @@ def compute_astro(dates: list) -> pd.DataFrame:
             out[c] = np.nan
     return out[cols]
 
-# -------------------- Discovery / lift lookup tables --------------------
+# -------------------- Lift lookup tables --------------------
 def lift_lookup_fast(events_side: pd.DataFrame, min_n_events: int) -> tuple[float, dict, pd.DataFrame]:
     base = float(events_side["y_revert"].mean())
     rows = []
@@ -358,7 +418,14 @@ def lift_lookup_slow(df_trend: pd.DataFrame, min_n_days: int) -> tuple[float, di
     return base_up, lk, df
 
 # -------------------- Charting --------------------
-def plot_slice(df_slice: pd.DataFrame, title: str, show_bb: bool, show_ema200: bool, vlines: list | None = None):
+def plot_slice(
+    df_slice: pd.DataFrame,
+    title: str,
+    show_bb: bool,
+    show_ema200: bool,
+    vlines: list | None = None,
+    highlight_window: tuple | None = None,
+):
     fig = go.Figure()
 
     fig.add_trace(go.Candlestick(
@@ -375,6 +442,12 @@ def plot_slice(df_slice: pd.DataFrame, title: str, show_bb: bool, show_ema200: b
     if show_ema200 and "ema200" in df_slice.columns:
         fig.add_trace(go.Scatter(x=df_slice["Date"].astype(str), y=df_slice["ema200"], mode="lines", name="EMA200"))
 
+    # Highlight actual placement window inside context
+    if highlight_window is not None:
+        w0, w1 = highlight_window
+        fig.add_vrect(x0=str(w0), x1=str(w1), opacity=0.14, line_width=0)
+
+    # Event vlines
     if vlines:
         for x in vlines:
             d = x.get("date")
@@ -388,22 +461,17 @@ def plot_slice(df_slice: pd.DataFrame, title: str, show_bb: bool, show_ema200: b
 
     fig.update_layout(
         title=title,
-        height=420,
+        height=430,
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
     )
     st.plotly_chart(fig, use_container_width=True)
 
 def plot_future_lifts(df_future: pd.DataFrame, base_prob: float, lk: dict, feature_list: list, title_prefix: str, prob_label: str):
-    """
-    df_future includes Date + features.
-    lk[(feat, value)] -> {lift_pp, n, ...}
-    """
     if df_future.empty:
         st.info("No future dates available.")
         return
 
-    # Build timeseries of lift per feature for that day's active value
     out = pd.DataFrame({"Date": df_future["Date"]})
     for feat in feature_list:
         vals = df_future[feat] if feat in df_future.columns else pd.Series([np.nan]*len(df_future))
@@ -415,11 +483,9 @@ def plot_future_lifts(df_future: pd.DataFrame, base_prob: float, lk: dict, featu
                 lifts.append(0.0)
         out[feat] = lifts
 
-    # Total force = baseline + sum of lifts (pp)/100
     out["TotalLift_pp"] = out[feature_list].sum(axis=1)
     out["ForceProb"] = np.clip(base_prob + out["TotalLift_pp"]/100.0, 0.0, 1.0)
 
-    # Chart 1: Force probability
     fig1 = go.Figure()
     fig1.add_trace(go.Scatter(x=out["Date"].astype(str), y=out["ForceProb"], mode="lines", name=prob_label))
     fig1.add_hline(y=base_prob, line_dash="dash", opacity=0.5)
@@ -432,14 +498,13 @@ def plot_future_lifts(df_future: pd.DataFrame, base_prob: float, lk: dict, featu
     )
     st.plotly_chart(fig1, use_container_width=True)
 
-    # Chart 2: Lift lines per feature
     fig2 = go.Figure()
     for feat in feature_list:
         fig2.add_trace(go.Scatter(x=out["Date"].astype(str), y=out[feat], mode="lines", name=feat))
     fig2.add_trace(go.Scatter(x=out["Date"].astype(str), y=out["TotalLift_pp"], mode="lines", name="TotalLift_pp"))
     fig2.update_layout(
         title=f"{title_prefix} — Lift contribution by placement (pp)",
-        height=420,
+        height=430,
         xaxis_title="Date",
         yaxis_title="Lift (percentage-points)",
         hovermode="x unified",
@@ -450,7 +515,7 @@ def plot_future_lifts(df_future: pd.DataFrame, base_prob: float, lk: dict, featu
 # UI
 # ============================================================
 st.title("Planetary Edge Finder")
-st.caption("FAST planets: peaks/bottoms episodes (Level-1) • SLOW planets: EMA200 trend regimes")
+st.caption("FAST: Level-1 peaks/bottoms reversion • SLOW: EMA200 trend regimes • Occurrence charts include zoom-out + other-planet legend")
 
 with st.sidebar:
     st.header("Asset")
@@ -477,6 +542,28 @@ with st.sidebar:
     show_bb = st.checkbox("Show Bollinger thresholds (FAST charts)", value=True)
     show_ema = st.checkbox("Show EMA200 (SLOW charts)", value=True)
     max_occ_charts = st.slider("Max occurrence charts to render", 5, 80, 25)
+
+    st.header("Occurrence chart context")
+    context_mode = st.selectbox(
+        "Zoom-out context",
+        ["None", "1M before/after", "3M before/after", "6M before/after", "1Y before/after", "Custom days"],
+        index=1
+    )
+    custom_days = st.number_input("Custom days (each side)", 7, 2000, 90, step=1)
+    pad_days = context_days_from_mode(context_mode, int(custom_days))
+
+    show_planet_legend = st.checkbox("Show other-planet legend per occurrence chart", value=True)
+
+    legend_planets_fast = st.multiselect(
+        "Legend planets (FAST occurrence charts)",
+        ["Moon_sign","Mercury_sign","Venus_sign","Mars_sign","Phase","Mercury_retro","Moon_Node","Rahu_sign","Ketu_sign"],
+        default=["Mercury_sign","Venus_sign","Moon_sign","Phase","Rahu_sign","Ketu_sign"]
+    )
+    legend_planets_slow = st.multiselect(
+        "Legend planets (SLOW occurrence charts)",
+        ["Jupiter_sign","Saturn_sign","Rahu_sign","Ketu_sign","Jupiter_retro","Saturn_retro","JS_aspect"],
+        default=["Jupiter_sign","Saturn_sign","Rahu_sign","Ketu_sign","JS_aspect"]
+    )
 
 tabs = st.tabs(["FAST: Reversion Edge (Level-1)", "SLOW: Trend Edge (EMA200)", "Future Force"])
 
@@ -507,14 +594,6 @@ df_slow_all = df_slow_all.merge(df_astro, on="Date", how="left")
 # ============================================================
 with tabs[0]:
     st.subheader("FAST: Reversion Edge on Level-1 Overextension Events")
-    st.markdown(
-        """
-**Meaning**
-- We only evaluate **event starts** (first day of an overextension streak).
-- A **WIN** means price returns to MA20 within the lookahead window before the stop-out extension.
-- This is measuring **peak/bottom episode mean-reversion**, not slow-trend direction.
-"""
-    )
 
     colA, colB = st.columns([1, 2])
     with colA:
@@ -523,9 +602,8 @@ with tabs[0]:
         st.markdown(
             """
 <div class="smallmuted">
-U = overextension above Upper threshold (peaky zone).<br>
-D = overextension below Lower threshold (bottomy zone).<br>
-Lift is reported in <b>percentage-points</b> vs the baseline for this side.
+U = overextension above Upper threshold (peaky zone). D = overextension below Lower threshold (bottomy zone).<br>
+Occurrence charts show the placement period, plus your chosen zoom-out context. Actual placement window is shaded.
 </div>
 """,
             unsafe_allow_html=True,
@@ -582,7 +660,6 @@ Lift is reported in <b>percentage-points</b> vs the baseline for this side.
         if rahu_signs: fast_combo["Rahu_sign"] = rahu_signs
         if ketu_signs: fast_combo["Ketu_sign"] = ketu_signs
 
-    # Metrics on event-days only
     baseline_n = int(len(events_side))
     if fast_combo:
         m_ev = match_combo(events_side, fast_combo)
@@ -614,27 +691,17 @@ Lift is reported in <b>percentage-points</b> vs the baseline for this side.
     k3.metric("Edge vs baseline", safe_pp(edge_pp))
     k4.metric("Combo n (events)", f"{combo_n}")
 
-    # -------- Occurrence charts (placement periods) --------
-    st.subheader("FAST occurrence charts (each placement-period as a separate collapsible chart)")
-    st.markdown(
-        """
-This section is **not** one chart with points.  
-It creates **one chart per period** where your selected placement combo is continuously active (e.g., “Mars in Virgo” is a multi-day zone).
-Inside each period-chart, Level-1 **event starts** are shown as vertical lines (green=win, red=loss) for the chosen side.
-"""
-    )
-
+    # Occurrence charts with context + legend
+    st.subheader("FAST occurrence charts (one per placement-period)")
     if not fast_combo:
         st.info("Select at least one placement in the FAST combo builder to generate occurrence charts.")
     else:
-        # Build periods from full daily data
         mask_full = match_combo(df_fast_all, fast_combo)
         blocks = contiguous_blocks(mask_full)
 
         if len(blocks) == 0:
             st.info("No historical placement periods found for this combo.")
         else:
-            # Prefer showing most recent occurrences first
             block_ranges = []
             for a, b in blocks:
                 block_ranges.append((df_fast_all.loc[a, "Date"], df_fast_all.loc[b, "Date"], a, b))
@@ -645,18 +712,22 @@ Inside each period-chart, Level-1 **event starts** are shown as vertical lines (
                 if shown >= max_occ_charts:
                     break
 
-                df_slice = df_fast_all.iloc[a:b+1].copy()
+                # context slice
+                start_ctx = start_d - timedelta(days=pad_days)
+                end_ctx = end_d + timedelta(days=pad_days)
+                df_slice = df_fast_all[(df_fast_all["Date"] >= start_ctx) & (df_fast_all["Date"] <= end_ctx)].copy()
 
-                # Event lines inside the period, only for chosen side
+                # actual placement period (for legend + shading)
+                df_period = df_fast_all.iloc[a:b+1].copy()
+
+                # event lines inside the actual placement period
                 vlines = []
                 ev_slice = combo_events[(combo_events["Date"] >= start_d) & (combo_events["Date"] <= end_d)].copy()
                 if len(ev_slice):
                     for _, r in ev_slice.iterrows():
                         vlines.append({"date": r["Date"], "outcome": int(r["y_revert"])})
 
-                # Title
-                title = f"{start_d} → {end_d}  |  days={len(df_slice)}  |  {side}-events in period={len(ev_slice)}"
-
+                title = f"{start_d} → {end_d} | placement-days={len(df_period)} | {side}-events={len(ev_slice)} | context=±{pad_days}d"
                 with st.expander(title, expanded=(shown < 3)):
                     plot_slice(
                         df_slice,
@@ -664,20 +735,15 @@ Inside each period-chart, Level-1 **event starts** are shown as vertical lines (
                         show_bb=show_bb,
                         show_ema200=False,
                         vlines=vlines,
+                        highlight_window=(start_d, end_d),
                     )
+                    if show_planet_legend:
+                        summary = summarize_other_planets(df_period, legend_planets_fast, top_k=2)
+                        render_legend_box(summary)
 
                 shown += 1
 
-    # -------- Discovery table (single-feature) --------
     st.subheader("FAST discovery: single placements ranked by lift (pp)")
-    st.markdown(
-        """
-**How to read**
-- **P(revert|value)** = success rate on event days when that placement is active (for your chosen side U/D).
-- **Lift (pp)** = P(revert|value) − baseline, in percentage-points.
-- Filter by min events (n) to enforce stability.
-"""
-    )
     if disc_fast is None or len(disc_fast) == 0:
         st.info("No FAST single-feature signals meet the minimum event count.")
     else:
@@ -691,20 +757,11 @@ Inside each period-chart, Level-1 **event starts** are shown as vertical lines (
 # ============================================================
 with tabs[1]:
     st.subheader("SLOW: Trend Edge using EMA200 Regime (Jupiter/Saturn/Rahu/Ketu)")
-    st.markdown(
-        """
-**Meaning**
-- Every day is labeled **UP** if Close ≥ EMA200 else **DOWN**.
-- We measure whether a slow-planet placement biases the market toward the UP regime.
-- This is **trend-based**, not reversal-based.
-"""
-    )
 
     base_up, lk_slow, disc_slow = lift_lookup_slow(df_slow_all, min_n_days=min_n_days)
     base_dn = float(df_slow_all["is_downtrend"].mean())
     base_days = int(len(df_slow_all))
 
-    # Slow combo builder
     with st.expander("SLOW combo builder (placements)", expanded=True):
         c1, c2, c3, c4 = st.columns(4)
         with c1:
@@ -735,7 +792,6 @@ with tabs[1]:
     if sat_retro != "Any":
         slow_combo["Saturn_retro"] = (sat_retro == "True")
 
-    # Metrics on daily regime
     if slow_combo:
         m_day = match_combo(df_slow_all, slow_combo)
         slow_sub = df_slow_all[m_day].copy()
@@ -767,15 +823,7 @@ with tabs[1]:
     k3.metric("Lift in P(UP)", safe_pp(lift_up_pp))
     k4.metric("Combo n (days)", f"{n_days}")
 
-    # -------- Occurrence charts (placement periods) --------
-    st.subheader("SLOW occurrence charts (each placement-period as a separate collapsible chart)")
-    st.markdown(
-        """
-Each chart is **one continuous period** where your slow-planet combo is active (e.g., “Jupiter in Aries” is a long zone).
-The chart is restricted to that period so price auto-scales to the relevant move.
-"""
-    )
-
+    st.subheader("SLOW occurrence charts (one per placement-period)")
     if not slow_combo:
         st.info("Select at least one placement in the SLOW combo builder to generate occurrence charts.")
     else:
@@ -795,9 +843,12 @@ The chart is restricted to that period so price auto-scales to the relevant move
                 if shown >= max_occ_charts:
                     break
 
-                df_slice = df_slow_all.iloc[a:b+1].copy()
-                title = f"{start_d} → {end_d}  |  days={len(df_slice)}  |  P(UP) in period={df_slice['is_uptrend'].mean()*100:.1f}%"
+                start_ctx = start_d - timedelta(days=pad_days)
+                end_ctx = end_d + timedelta(days=pad_days)
+                df_slice = df_slow_all[(df_slow_all["Date"] >= start_ctx) & (df_slow_all["Date"] <= end_ctx)].copy()
+                df_period = df_slow_all.iloc[a:b+1].copy()
 
+                title = f"{start_d} → {end_d} | placement-days={len(df_period)} | P(UP) in period={df_period['is_uptrend'].mean()*100:.1f}% | context=±{pad_days}d"
                 with st.expander(title, expanded=(shown < 3)):
                     plot_slice(
                         df_slice,
@@ -805,20 +856,15 @@ The chart is restricted to that period so price auto-scales to the relevant move
                         show_bb=False,
                         show_ema200=show_ema,
                         vlines=None,
+                        highlight_window=(start_d, end_d),
                     )
+                    if show_planet_legend:
+                        summary = summarize_other_planets(df_period, legend_planets_slow, top_k=2)
+                        render_legend_box(summary)
 
                 shown += 1
 
-    # -------- Discovery table (single-feature) --------
     st.subheader("SLOW discovery: single placements ranked by UP-regime lift (pp)")
-    st.markdown(
-        """
-**How to read**
-- **P(UP|value)** = fraction of days above EMA200 while that placement is active.
-- **Lift (pp)** = P(UP|value) − baseline P(UP), in percentage-points.
-- Use min-days threshold to reduce instability.
-"""
-    )
     if disc_slow is None or len(disc_slow) == 0:
         st.info("No SLOW single-feature signals meet the minimum day count.")
     else:
@@ -829,18 +875,10 @@ The chart is restricted to that period so price auto-scales to the relevant move
         st.dataframe(df_show, use_container_width=True, height=440)
 
 # ============================================================
-# TAB 3: Future Force (timeseries of lifts for upcoming transits)
+# TAB 3: Future Force
 # ============================================================
 with tabs[2]:
     st.subheader("Future Force: Lift Timeseries (next N days)")
-    st.markdown(
-        """
-This computes upcoming sidereal placements and maps them to **historical lifts**:
-- FAST: uses **event-side** baseline/lifts (U or D) from Level-1 events.
-- SLOW: uses **EMA200 regime** baseline/lifts for UP probability.
-The output is a timeseries showing how each placement’s lift changes over the forecast window.
-"""
-    )
 
     col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
@@ -848,7 +886,7 @@ The output is a timeseries showing how each placement’s lift changes over the 
     with col2:
         future_mode = st.selectbox("Mode", ["FAST (reversion lifts)", "SLOW (trend lifts)"], index=0)
     with col3:
-        st.markdown('<div class="smallmuted">The “Total Force” line is baseline plus the sum of the per-feature lifts (pp) available for that day. This is a practical aggregator for scanning.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="smallmuted">Total Force = baseline + sum of lifts (pp) from all placements that have stable historical estimates (filtered by min-n).</div>', unsafe_allow_html=True)
 
     start = datetime.now(tz=UTC).date()
     future_dates = [start + timedelta(days=i) for i in range(1, int(future_days) + 1)]
@@ -859,7 +897,6 @@ The output is a timeseries showing how each placement’s lift changes over the 
         st.stop()
 
     if future_mode.startswith("FAST"):
-        # Need side selection + historical lift lookup from current app settings
         side_ff = st.radio("FAST side for lift mapping", ["U", "D"], horizontal=True, key="future_fast_side")
         events_side = events[(events["ext_dir"] == side_ff) & pd.notna(events["y_revert"])].copy()
         if len(events_side) == 0:
@@ -868,8 +905,7 @@ The output is a timeseries showing how each placement’s lift changes over the 
 
         base_fast, lk_fast, _ = lift_lookup_fast(events_side, min_n_events=min_n_events)
 
-        # Feature list for timeseries (exclude Moon_sign by default because it is extremely noisy)
-        include_moon = st.checkbox("Include Moon_sign line (very noisy)", value=False)
+        include_moon = st.checkbox("Include Moon_sign (very noisy)", value=False)
         ff_features = ["Mercury_sign", "Venus_sign", "Mars_sign", "Phase", "Mercury_retro", "Moon_Node", "Rahu_sign", "Ketu_sign"]
         if include_moon:
             ff_features = ["Moon_sign"] + ff_features
