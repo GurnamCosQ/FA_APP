@@ -3,7 +3,7 @@ import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
 import streamlit as st
-import swisseph as swe
+import pyswisseph as swe
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
