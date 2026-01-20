@@ -2,13 +2,33 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 import swisseph as swe
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # -------------------- Global config --------------------
-st.set_page_config(page_title="Planetary Force (Level-1)", layout="wide")
+st.set_page_config(page_title="Planetary Force Analytics", layout="wide", initial_sidebar_state="expanded")
+
+# Custom CSS for better UI
+st.markdown("""
+    <style>
+    .metric-card {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 20px;
+        border-radius: 10px;
+        color: white;
+        text-align: center;
+    }
+    .stMetric {
+        background-color: #f0f2f6;
+        padding: 15px;
+        border-radius: 8px;
+        border-left: 4px solid #667eea;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
 SIGNS = ["Aries","Taurus","Gemini","Cancer","Leo","Virgo","Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"]
 IST = ZoneInfo("Asia/Kolkata")
@@ -19,17 +39,16 @@ ASSET_PRESETS = {
     "Silver (SI=F)": "SI=F",
     "Gold (GC=F)": "GC=F",
     "Crude (CL=F)": "CL=F",
+    "Bitcoin (BTC-USD)": "BTC-USD",
+    "S&P 500 (^GSPC)": "^GSPC",
+    "NASDAQ (^IXIC)": "^IXIC",
 }
 
-# Swiss Ephemeris: Lahiri sidereal
 swe.set_sid_mode(swe.SIDM_LAHIRI)
 
-# Features used in the "brain" and force model
 FEATURES = [
-    # fast
     "Moon_sign", "Mercury_sign", "Venus_sign", "Mars_sign",
     "Phase", "Mercury_retro", "Moon_Node", "Rahu_sign", "Ketu_sign",
-    # slow
     "Jupiter_sign", "Saturn_sign", "Jupiter_retro", "Saturn_retro",
 ]
 
@@ -38,13 +57,11 @@ def sign_from_lon(lon_deg: float) -> str:
     return SIGNS[int((lon_deg % 360.0) // 30)]
 
 def julday_fast(d, hour_ist: int = 10) -> float:
-    # Gemini convention: 10:00 IST -> UTC
     dt_local = datetime(d.year, d.month, d.day, hour_ist, 0, 0, tzinfo=IST)
     dt_utc = dt_local.astimezone(UTC)
     return swe.julday(dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour + dt_utc.minute/60.0 + dt_utc.second/3600.0)
 
 def julday_slow(d, hour_utc: int = 12) -> float:
-    # Long planets convention: 12:00 UTC
     dt_utc = datetime(d.year, d.month, d.day, hour_utc, 0, 0, tzinfo=UTC)
     return swe.julday(dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour)
 
@@ -71,53 +88,32 @@ def match_combo(df: pd.DataFrame, combo: dict) -> pd.Series:
 @st.cache_data(show_spinner=False)
 def fetch_price(symbol: str, period: str, interval: str) -> pd.DataFrame:
     raw = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False)
-
     if raw is None or len(raw) == 0:
         return pd.DataFrame(columns=["Date","Open","High","Low","Close","Volume"])
-
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
-
     df = raw.reset_index().copy()
-
-    # Normalize yfinance date column name
     if "Date" in df.columns:
         dt_col = "Date"
     elif "Datetime" in df.columns:
         dt_col = "Datetime"
     else:
         dt_col = df.columns[0]
-
     df = df.rename(columns={dt_col: "Date"})
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
     df = df[pd.notna(df["Date"])].copy()
-
     return df
 
-def compute_tech_labels(
-    df_px: pd.DataFrame,
-    bb_window: int,
-    bb_k: float,
-    margin_sigma: float,
-    lookahead_days: int,
-    stop_out_pct: float,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+def compute_tech_labels(df_px: pd.DataFrame, bb_window: int, bb_k: float, margin_sigma: float, lookahead_days: int, stop_out_pct: float) -> tuple[pd.DataFrame, pd.DataFrame]:
     df = df_px.copy()
-
-    # TP + BB thresholds (same event logic)
     df["TP"] = (df["High"] + df["Low"]) / 2.0
     df["MA20"] = df["TP"].rolling(bb_window).mean()
     df["STD20"] = df["TP"].rolling(bb_window).std()
     df["UpperThreshold"] = df["MA20"] + (bb_k - margin_sigma) * df["STD20"]
     df["LowerThreshold"] = df["MA20"] - (bb_k - margin_sigma) * df["STD20"]
-
-    df["ext_dir"] = np.where(
-        df["TP"] >= df["UpperThreshold"], "U",
-        np.where(df["TP"] <= df["LowerThreshold"], "D", "N")
-    )
+    df["ext_dir"] = np.where(df["TP"] >= df["UpperThreshold"], "U", np.where(df["TP"] <= df["LowerThreshold"], "D", "N"))
     df["event_start"] = (df["ext_dir"] != df["ext_dir"].shift(1)) & (df["ext_dir"] != "N")
 
-    # y_revert on event days only (Gemini logic)
     y_revert = [np.nan] * len(df)
     for i in range(len(df)):
         if not bool(df.loc[i, "event_start"]):
@@ -125,10 +121,8 @@ def compute_tech_labels(
         side = df.loc[i, "ext_dir"]
         if side not in ("U", "D"):
             continue
-
         ref_high = float(df.loc[i, "High"])
         ref_low = float(df.loc[i, "Low"])
-
         success = 0
         for j in range(i + 1, min(i + 1 + lookahead_days, len(df))):
             tp_j = float(df.loc[j, "TP"])
@@ -136,7 +130,6 @@ def compute_tech_labels(
             if pd.isna(ma_j):
                 continue
             ma_j = float(ma_j)
-
             if side == "U":
                 if tp_j <= ma_j:
                     success = 1
@@ -151,25 +144,18 @@ def compute_tech_labels(
                 if tp_j < ref_low * (1.0 - stop_out_pct):
                     success = 0
                     break
-
         y_revert[i] = success
-
     df["y_revert"] = y_revert
-
-    # EMA200 trend (context; not used for force score here)
     df["ema200"] = df["Close"].ewm(span=200, adjust=False).mean()
     df["trend"] = np.where(df["Close"] >= df["ema200"], "UP", "DOWN")
-
     level1 = df[df["event_start"] & df["ext_dir"].isin(["U", "D"])].copy()
     return df, level1
 
 @st.cache_data(show_spinner=False)
 def compute_astro(dates: list) -> pd.DataFrame:
-    # Always return DF with Date + expected columns (fix for merge KeyError)
     cols = ["Date"] + FEATURES
     if dates is None or len(dates) == 0:
         return pd.DataFrame(columns=cols)
-
     norm_dates = pd.to_datetime(pd.Series(dates), errors="coerce").dt.date
     norm_dates = [d for d in norm_dates.tolist() if pd.notna(d)]
     if len(norm_dates) == 0:
@@ -179,30 +165,22 @@ def compute_astro(dates: list) -> pd.DataFrame:
     for d in norm_dates:
         jd_f = julday_fast(d, hour_ist=10)
         jd_s = julday_slow(d, hour_utc=12)
-
-        # Fast set
         moon_lon, _ = sidereal_lon_speed(jd_f, swe.MOON)
         merc_lon, merc_sp = sidereal_lon_speed(jd_f, swe.MERCURY)
         ven_lon, _ = sidereal_lon_speed(jd_f, swe.VENUS)
         mars_lon, _ = sidereal_lon_speed(jd_f, swe.MARS)
         sun_lon, _ = sidereal_lon_speed(jd_f, swe.SUN)
-
         rahu_lon, _ = sidereal_lon_speed(jd_f, swe.MEAN_NODE)
         ketu_lon = (rahu_lon + 180.0) % 360.0
-
         phase_angle = (moon_lon - sun_lon) % 360.0
         phase = "Waxing" if phase_angle < 180.0 else "Waning"
-
         d_moon_rahu = abs((moon_lon - rahu_lon + 180.0) % 360.0 - 180.0)
         moon_node = "Conjunct" if (d_moon_rahu <= 15.0 or abs(d_moon_rahu - 180.0) <= 15.0) else "None"
-
-        # Slow set
         jup_lon, jup_sp = sidereal_lon_speed(jd_s, swe.JUPITER)
         sat_lon, sat_sp = sidereal_lon_speed(jd_s, swe.SATURN)
 
         rows.append({
             "Date": d,
-
             "Moon_sign": sign_from_lon(moon_lon),
             "Mercury_sign": sign_from_lon(merc_lon),
             "Venus_sign": sign_from_lon(ven_lon),
@@ -212,7 +190,6 @@ def compute_astro(dates: list) -> pd.DataFrame:
             "Rahu_sign": sign_from_lon(rahu_lon),
             "Ketu_sign": sign_from_lon(ketu_lon),
             "Moon_Node": moon_node,
-
             "Jupiter_sign": sign_from_lon(jup_lon),
             "Saturn_sign": sign_from_lon(sat_lon),
             "Jupiter_retro": bool(jup_sp < 0),
@@ -220,7 +197,6 @@ def compute_astro(dates: list) -> pd.DataFrame:
         })
 
     out = pd.DataFrame(rows)
-    # Ensure exact column order
     for c in cols:
         if c not in out.columns:
             out[c] = np.nan
@@ -229,16 +205,13 @@ def compute_astro(dates: list) -> pd.DataFrame:
 # -------------------- Brain + force model --------------------
 def build_brain(df_events: pd.DataFrame, min_n: int = 15) -> dict:
     brain = {"min_n": min_n, "U": {"baseline": None, "table": {}}, "D": {"baseline": None, "table": {}}}
-
     for side in ["U", "D"]:
         sub = df_events[(df_events["ext_dir"] == side) & pd.notna(df_events["y_revert"])].copy()
         if len(sub) == 0:
             brain[side]["baseline"] = np.nan
             continue
-
         baseline = float(sub["y_revert"].mean())
         brain[side]["baseline"] = baseline
-
         for feat in FEATURES:
             if feat not in sub.columns:
                 continue
@@ -251,7 +224,6 @@ def build_brain(df_events: pd.DataFrame, min_n: int = 15) -> dict:
                 p = float(r["mean"])
                 lift_pp = (p - baseline) * 100.0
                 brain[side]["table"][(feat, val)] = {"n": n, "p": p, "lift_pp": lift_pp}
-
     return brain
 
 def force_score(row: pd.Series, brain: dict, side: str, k_shrink: float = 50.0) -> tuple[float, list]:
@@ -259,11 +231,9 @@ def force_score(row: pd.Series, brain: dict, side: str, k_shrink: float = 50.0) 
     table = brain.get(side, {}).get("table", {})
     if not np.isfinite(base):
         return np.nan, []
-
     lifts = []
     weights = []
     breakdown = []
-
     for feat in FEATURES:
         key = (feat, row.get(feat))
         if key not in table:
@@ -274,148 +244,271 @@ def force_score(row: pd.Series, brain: dict, side: str, k_shrink: float = 50.0) 
         lifts.append(lift_pp)
         weights.append(w)
         breakdown.append({"feature": feat, "value": row.get(feat), "lift_pp": lift_pp, "n": n, "weight": w})
-
     if not weights:
         return float(base), []
-
     total_lift_pp = float(np.dot(weights, lifts) / np.sum(weights))
     score = float(base + total_lift_pp / 100.0)
     score = float(max(0.0, min(1.0, score)))
     breakdown = sorted(breakdown, key=lambda x: abs(x["lift_pp"]), reverse=True)
     return score, breakdown
 
-# -------------------- Chart helpers --------------------
-def add_sign_zone(fig, df: pd.DataFrame, feat: str, sign: str):
-    # Shade contiguous ranges where df[feat] == sign
-    if feat not in df.columns:
-        return
-    z = (df[feat] == sign).fillna(False).values
-    idx = np.where(z)[0]
-    if len(idx) == 0:
-        return
+# -------------------- Enhanced Chart Functions --------------------
+def create_main_chart(df: pd.DataFrame, hit_dates: list, side: str, symbol: str):
+    """Enhanced multi-panel chart with price, volume, force score, and events"""
+    fig = make_subplots(
+        rows=4, cols=1,
+        shared_xaxis=True,
+        vertical_spacing=0.03,
+        subplot_titles=('Price & Bollinger Bands', 'Volume', 'Force Score Timeline', 'Event Distribution'),
+        row_heights=[0.5, 0.15, 0.20, 0.15],
+        specs=[[{"secondary_y": False}],
+               [{"secondary_y": False}],
+               [{"secondary_y": False}],
+               [{"secondary_y": False}]]
+    )
 
-    blocks = []
-    start = idx[0]
-    prev = idx[0]
-    for i in idx[1:]:
-        if i == prev + 1:
-            prev = i
-        else:
-            blocks.append((start, prev))
-            start = i
-            prev = i
-    blocks.append((start, prev))
-
-    for a, b in blocks:
-        x0 = str(df.loc[a, "Date"])
-        x1 = str(df.loc[b, "Date"])
-        fig.add_vrect(x0=x0, x1=x1, opacity=0.14, line_width=0)
-
-def plot_price_with_overlays(df: pd.DataFrame, hit_dates: list, zone_feat: str | None, zone_sign: str | None, title: str):
-    fig = go.Figure()
-
+    # Panel 1: Candlestick with BB
     fig.add_trace(go.Candlestick(
         x=df["Date"].astype(str),
         open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-        name="Price"
-    ))
+        name="Price",
+        increasing_line_color='#26a69a',
+        decreasing_line_color='#ef5350'
+    ), row=1, col=1)
 
-    fig.add_trace(go.Scatter(x=df["Date"].astype(str), y=df["MA20"], mode="lines", name="MA20"))
-    fig.add_trace(go.Scatter(x=df["Date"].astype(str), y=df["UpperThreshold"], mode="lines", name="UpperThreshold"))
-    fig.add_trace(go.Scatter(x=df["Date"].astype(str), y=df["LowerThreshold"], mode="lines", name="LowerThreshold"))
+    fig.add_trace(go.Scatter(
+        x=df["Date"].astype(str), y=df["MA20"],
+        mode="lines", name="MA20",
+        line=dict(color='#ffa726', width=2)
+    ), row=1, col=1)
 
-    # Optional shaded sign zone (contiguous)
-    if zone_feat and zone_sign:
-        add_sign_zone(fig, df, zone_feat, zone_sign)
+    fig.add_trace(go.Scatter(
+        x=df["Date"].astype(str), y=df["UpperThreshold"],
+        mode="lines", name="Upper",
+        line=dict(color='rgba(255,0,0,0.3)', dash='dash'),
+        fill=None
+    ), row=1, col=1)
 
-    # Vertical lines for combo hits
+    fig.add_trace(go.Scatter(
+        x=df["Date"].astype(str), y=df["LowerThreshold"],
+        mode="lines", name="Lower",
+        line=dict(color='rgba(0,255,0,0.3)', dash='dash'),
+        fill='tonexty',
+        fillcolor='rgba(100,100,100,0.1)'
+    ), row=1, col=1)
+
+    # Panel 2: Volume
+    colors = ['#ef5350' if df.loc[i, 'Close'] < df.loc[i, 'Open'] else '#26a69a' for i in df.index]
+    fig.add_trace(go.Bar(
+        x=df["Date"].astype(str), y=df["Volume"],
+        name="Volume",
+        marker_color=colors,
+        showlegend=False
+    ), row=2, col=1)
+
+    # Panel 3: Force Score Timeline (if available)
+    if 'force_score' in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df["Date"].astype(str), y=df["force_score"],
+            mode="lines+markers",
+            name="Force Score",
+            line=dict(color='#667eea', width=2),
+            marker=dict(size=4)
+        ), row=3, col=1)
+        
+        # Add baseline reference
+        if 'baseline' in df.columns:
+            fig.add_trace(go.Scatter(
+                x=df["Date"].astype(str), y=df["baseline"],
+                mode="lines",
+                name="Baseline",
+                line=dict(color='gray', dash='dot', width=1)
+            ), row=3, col=1)
+
+    # Panel 4: Event markers
+    event_df = df[df["event_start"] == True].copy()
+    if len(event_df):
+        up_events = event_df[event_df["ext_dir"] == "U"]
+        down_events = event_df[event_df["ext_dir"] == "D"]
+        
+        fig.add_trace(go.Scatter(
+            x=up_events["Date"].astype(str),
+            y=[1] * len(up_events),
+            mode="markers",
+            name="Upper Events",
+            marker=dict(symbol='triangle-up', size=10, color='red')
+        ), row=4, col=1)
+        
+        fig.add_trace(go.Scatter(
+            x=down_events["Date"].astype(str),
+            y=[0] * len(down_events),
+            mode="markers",
+            name="Lower Events",
+            marker=dict(symbol='triangle-down', size=10, color='green')
+        ), row=4, col=1)
+
+    # Add combo hit vertical lines
     for d in hit_dates:
-        fig.add_vline(x=str(d), opacity=0.30, line_width=1)
+        fig.add_vline(x=str(d), line_width=2, line_dash="dash", 
+                     line_color="rgba(102, 126, 234, 0.5)")
 
     fig.update_layout(
-        title=title,
-        xaxis_title="Date",
-        yaxis_title="Price",
-        height=680,
+        title=dict(text=f"{symbol} - Planetary Force Analysis ({side} Side)", font=dict(size=20)),
+        height=1000,
+        hovermode='x unified',
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         xaxis_rangeslider_visible=False,
+        plot_bgcolor='#f8f9fa',
+        paper_bgcolor='white'
     )
-    st.plotly_chart(fig, use_container_width=True)
+
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(0,0,0,0.1)')
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(0,0,0,0.1)')
+
+    return fig
+
+def create_force_breakdown_chart(breakdown: list):
+    """Horizontal bar chart for force breakdown"""
+    if not breakdown:
+        return None
+    
+    df = pd.DataFrame(breakdown)
+    df = df.sort_values('lift_pp')
+    
+    colors = ['#ef5350' if x < 0 else '#26a69a' for x in df['lift_pp']]
+    
+    fig = go.Figure(go.Bar(
+        x=df['lift_pp'],
+        y=[f"{row['feature']}: {row['value']}" for _, row in df.iterrows()],
+        orientation='h',
+        marker_color=colors,
+        text=df['lift_pp'].round(2),
+        textposition='outside',
+        hovertemplate='<b>%{y}</b><br>Lift: %{x:.2f}pp<br>Weight: %{customdata[0]:.3f}<br>Samples: %{customdata[1]}<extra></extra>',
+        customdata=df[['weight', 'n']].values
+    ))
+    
+    fig.update_layout(
+        title="Force Components (Lift %)",
+        xaxis_title="Lift (percentage points)",
+        yaxis_title="",
+        height=max(400, len(breakdown) * 35),
+        showlegend=False,
+        plot_bgcolor='#f8f9fa',
+        paper_bgcolor='white'
+    )
+    
+    fig.add_vline(x=0, line_width=2, line_color='black')
+    
+    return fig
+
+def create_performance_heatmap(occ: pd.DataFrame):
+    """Heatmap of returns by planetary placement"""
+    if len(occ) == 0:
+        return None
+    
+    # Create pivot for Moon sign vs returns
+    ret_cols = [c for c in occ.columns if c.startswith('ret_') and c.endswith('_pct')]
+    if not ret_cols or 'Moon_sign' not in occ.columns:
+        return None
+    
+    pivot = occ.groupby('Moon_sign')[ret_cols].mean()
+    
+    fig = go.Figure(data=go.Heatmap(
+        z=pivot.values,
+        x=[c.replace('ret_', '').replace('_pct', '') for c in pivot.columns],
+        y=pivot.index,
+        colorscale='RdYlGn',
+        zmid=0,
+        text=np.round(pivot.values, 2),
+        texttemplate='%{text}',
+        textfont={"size": 10},
+        colorbar=dict(title="Return %")
+    ))
+    
+    fig.update_layout(
+        title="Average Returns by Moon Sign",
+        xaxis_title="Holding Period",
+        yaxis_title="Moon Sign",
+        height=400,
+        plot_bgcolor='white',
+        paper_bgcolor='white'
+    )
+    
+    return fig
 
 # -------------------- UI --------------------
-st.title("Planetary Force Dashboard — Level-1 Events (Fast + Slow Planets)")
-st.caption("Fast planets: top/bottom episodes (Level-1 overextensions). Slow planets: included as trend-setter context within the same force model.")
+st.title("🌟 Planetary Force Analytics Dashboard")
+st.markdown("Advanced astrological market analysis with enhanced visualizations")
 
 with st.sidebar:
-    st.header("Asset")
-    asset_label = st.selectbox("Preset", list(ASSET_PRESETS.keys()), index=0)
-    symbol_default = ASSET_PRESETS[asset_label]
-    symbol = st.text_input("Yahoo symbol", value=symbol_default).strip() or symbol_default
+    st.header("⚙️ Configuration")
+    
+    with st.expander("📊 Asset Selection", expanded=True):
+        asset_label = st.selectbox("Preset", list(ASSET_PRESETS.keys()), index=0)
+        symbol_default = ASSET_PRESETS[asset_label]
+        symbol = st.text_input("Yahoo symbol", value=symbol_default).strip() or symbol_default
+        period = st.selectbox("History", ["10y","5y","2y","1y"], index=0)
 
-    st.header("Event settings")
-    period = st.selectbox("History window", ["10y","5y","2y","max"], index=0)
-    interval = "1d"
+    with st.expander("🎯 Event Parameters", expanded=True):
+        bb_window = st.slider("BB Window", 10, 40, 20)
+        bb_k = st.slider("BB K", 1.0, 3.0, 2.0, 0.1)
+        margin_sigma = st.slider("Margin Sigma", 0.0, 1.0, 0.25, 0.05)
+        lookahead_days = st.slider("Lookahead days", 5, 30, 15)
+        stop_out_pct = st.slider("Stop-out %", 0.5, 5.0, 2.0, 0.1) / 100.0
+        side = st.radio("Side", ["U", "D"], horizontal=True, help="U=Upper, D=Lower")
 
-    bb_window = st.slider("BB Window", 10, 40, 20)
-    bb_k = st.slider("BB K", 1.0, 3.0, 2.0, 0.1)
-    margin_sigma = st.slider("Margin Sigma", 0.0, 1.0, 0.25, 0.05)
-    lookahead_days = st.slider("Lookahead days", 5, 30, 15)
-    stop_out_pct = st.slider("Stop-out %", 0.5, 5.0, 2.0, 0.1) / 100.0
-    side = st.radio("Side", ["U", "D"], horizontal=True)
+    with st.expander("🧠 Model Settings"):
+        min_n = st.slider("Min sample size", 5, 100, 15)
+        k_shrink = st.slider("Shrinkage k", 10, 200, 50)
 
-    st.header("Robustness")
-    min_n = st.slider("Min sample size (n)", 5, 100, 15)
-    k_shrink = st.slider("Shrinkage k", 10, 200, 50)
+    with st.expander("🌙 Planetary Filters"):
+        st.caption("Select placements to filter historical events")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            moon_sign = st.multiselect("Moon", SIGNS, default=[])
+            venus_sign = st.multiselect("Venus", SIGNS, default=[])
+            mars_sign = st.multiselect("Mars", SIGNS, default=[])
+        with col2:
+            merc_sign = st.multiselect("Mercury", SIGNS, default=[])
+            jup_sign = st.multiselect("Jupiter", SIGNS, default=[])
+            sat_sign = st.multiselect("Saturn", SIGNS, default=[])
+        
+        phase = st.multiselect("Lunar Phase", ["Waxing", "Waning"], default=[])
+        moon_node = st.multiselect("Moon-Node", ["Conjunct", "None"], default=[])
+        
+        merc_retro = st.selectbox("Mercury Rx", ["Any", "True", "False"], index=0)
+        jup_retro = st.selectbox("Jupiter Rx", ["Any", "True", "False"], index=0)
+        sat_retro = st.selectbox("Saturn Rx", ["Any", "True", "False"], index=0)
 
-    st.header("Combo (placements)")
-    st.caption("Leave empty = no filter (just show force + baseline).")
-
-    moon_sign = st.multiselect("Moon sign", SIGNS, default=[])
-    merc_sign = st.multiselect("Mercury sign", SIGNS, default=[])
-    venus_sign = st.multiselect("Venus sign", SIGNS, default=[])
-    mars_sign = st.multiselect("Mars sign", SIGNS, default=[])
-    jup_sign = st.multiselect("Jupiter sign", SIGNS, default=[])
-    sat_sign = st.multiselect("Saturn sign", SIGNS, default=[])
-
-    phase = st.multiselect("Phase", ["Waxing", "Waning"], default=[])
-    moon_node = st.multiselect("Moon-Node", ["Conjunct", "None"], default=[])
-
-    merc_retro = st.selectbox("Mercury retro", ["Any", "True", "False"], index=0)
-    jup_retro = st.selectbox("Jupiter retro", ["Any", "True", "False"], index=0)
-    sat_retro = st.selectbox("Saturn retro", ["Any", "True", "False"], index=0)
-
-    st.header("Chart overlay")
-    zone_feat = st.selectbox(
-        "Shade planet-in-sign zone",
-        ["None", "Mars_sign", "Mercury_sign", "Venus_sign", "Moon_sign", "Jupiter_sign", "Saturn_sign", "Rahu_sign", "Ketu_sign"],
-        index=0
-    )
-    zone_sign = None
-    if zone_feat != "None":
-        zone_sign = st.selectbox("Zone sign", SIGNS, index=0)
-
-    st.header("Future scan (minimal)")
-    future_days = st.slider("Scan next N days", 7, 90, 30)
-    top_k = st.slider("Top K dates", 3, 20, 5)
+    with st.expander("🔮 Future Scan"):
+        future_days = st.slider("Scan days ahead", 7, 90, 30)
+        top_k = st.slider("Show top dates", 3, 20, 5)
 
 # -------------------- Build pipeline --------------------
-df_px = fetch_price(symbol, period, interval)
+with st.spinner("Loading data..."):
+    df_px = fetch_price(symbol, period, "1d")
+    
 if df_px.empty:
-    st.error("No price data returned for this symbol/period. Try a different symbol or shorter history window.")
+    st.error("❌ No price data available. Try a different symbol or period.")
     st.stop()
 
-df_all, level1 = compute_tech_labels(df_px, bb_window, bb_k, margin_sigma, lookahead_days, stop_out_pct)
+with st.spinner("Computing technical indicators..."):
+    df_all, level1 = compute_tech_labels(df_px, bb_window, bb_k, margin_sigma, lookahead_days, stop_out_pct)
 
-df_astro = compute_astro(df_all["Date"].tolist())
-# Merge (KeyError-safe due to Date normalization + compute_astro always returning Date)
-df_all = df_all.merge(df_astro, on="Date", how="left")
-level1_all = level1.merge(df_astro, on="Date", how="left")
+with st.spinner("Computing planetary positions..."):
+    df_astro = compute_astro(df_all["Date"].tolist())
+    df_all = df_all.merge(df_astro, on="Date", how="left")
+    level1_all = level1.merge(df_astro, on="Date", how="left")
 
-# Brain train split (same as your earlier approach)
+# Train brain
 split_date = datetime(2022, 1, 1).date()
 train = level1_all[level1_all["Date"] < split_date].copy()
 brain = build_brain(train, min_n=min_n)
 
-# -------------------- Combo dict --------------------
+# Build combo filter
 combo = {}
 if moon_sign: combo["Moon_sign"] = moon_sign
 if merc_sign: combo["Mercury_sign"] = merc_sign
@@ -425,77 +518,124 @@ if jup_sign: combo["Jupiter_sign"] = jup_sign
 if sat_sign: combo["Saturn_sign"] = sat_sign
 if phase: combo["Phase"] = phase
 if moon_node: combo["Moon_Node"] = moon_node
+if merc_retro != "Any": combo["Mercury_retro"] = (merc_retro == "True")
+if jup_retro != "Any": combo["Jupiter_retro"] = (jup_retro == "True")
+if sat_retro != "Any": combo["Saturn_retro"] = (sat_retro == "True")
 
-if merc_retro != "Any":
-    combo["Mercury_retro"] = (merc_retro == "True")
-if jup_retro != "Any":
-    combo["Jupiter_retro"] = (jup_retro == "True")
-if sat_retro != "Any":
-    combo["Saturn_retro"] = (sat_retro == "True")
+# Compute force scores for all data
+baseline = brain[side]["baseline"]
+df_all['force_score'] = df_all.apply(lambda row: force_score(row, brain, side, k_shrink)[0], axis=1)
+df_all['baseline'] = baseline
 
-# -------------------- Metrics --------------------
+# Get today's analysis
 today = df_all.iloc[-1].copy()
 today_force, today_breakdown = force_score(today, brain, side=side, k_shrink=k_shrink)
 
+# Filter combo occurrences
 level1_side = level1_all[(level1_all["ext_dir"] == side) & pd.notna(level1_all["y_revert"])].copy()
-baseline = brain[side]["baseline"]
-
 occ = pd.DataFrame()
 if combo:
-    sub = level1_side.copy()
-    m = match_combo(sub, combo)
-    occ = sub[m].copy()
+    m = match_combo(level1_side, combo)
+    occ = level1_side[m].copy()
 
-combo_n = int(len(occ)) if combo else 0
+combo_n = len(occ) if combo else 0
 combo_p = float(occ["y_revert"].mean()) if len(occ) else np.nan
 
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Asset", symbol)
-c2.metric("Side", side)
-c3.metric("Baseline P(revert)", f"{baseline*100:.2f}%" if np.isfinite(baseline) else "n/a")
-c4.metric("Today's Force", f"{today_force*100:.2f}%" if np.isfinite(today_force) else "n/a")
-c5.metric("Combo n / P(revert)", f"{combo_n} / {combo_p*100:.1f}%" if np.isfinite(combo_p) else f"{combo_n} / n/a")
+# -------------------- Key Metrics Display --------------------
+st.markdown("### 📊 Key Metrics")
+col1, col2, col3, col4, col5 = st.columns(5)
 
-# -------------------- Chart: vlines for combo hits, optional sign zone shading --------------------
-hit_dates = []
-if len(occ):
-    hit_dates = occ["Date"].tolist()
+with col1:
+    st.metric("Asset", symbol)
+    st.metric("Side", side, help="U=Upper extreme, D=Lower extreme")
 
-zone_feat_resolved = None if zone_feat == "None" else zone_feat
-plot_price_with_overlays(
-    df_all,
-    hit_dates=hit_dates,
-    zone_feat=zone_feat_resolved,
-    zone_sign=zone_sign if zone_feat_resolved else None,
-    title=f"{symbol} — Candles + MA20/Thresholds + Combo Hit Lines ({side})",
-)
+with col2:
+    st.metric("Total Events", f"{len(level1_side):,}")
+    st.metric("Combo Matches", f"{combo_n:,}")
 
-# -------------------- Breakdown + Occurrence table --------------------
-left, right = st.columns([1, 1])
-
-with left:
-    st.subheader("Today's force breakdown")
-    if not today_breakdown:
-        st.info("No contributing placements met min_n for today. Force = baseline.")
+with col3:
+    if np.isfinite(baseline):
+        st.metric("Baseline P(revert)", f"{baseline*100:.1f}%")
     else:
-        bd = pd.DataFrame(today_breakdown)
-        bd["lift_pp"] = bd["lift_pp"].map(lambda x: round(float(x), 2))
-        bd["weight"] = bd["weight"].map(lambda x: round(float(x), 3))
-        st.dataframe(bd, use_container_width=True, height=320)
-
-with right:
-    st.subheader("Combo definition")
-    if combo:
-        st.json(combo)
+        st.metric("Baseline P(revert)", "N/A")
+    
+    if np.isfinite(combo_p):
+        delta = (combo_p - baseline) * 100 if np.isfinite(baseline) else None
+        st.metric("Combo P(revert)", f"{combo_p*100:.1f}%", 
+                 delta=f"{delta:+.1f}pp" if delta else None)
     else:
-        st.info("No combo selected. Add placements in the sidebar to highlight historical hits.")
+        st.metric("Combo P(revert)", "N/A")
 
-st.subheader("Historical occurrences (Level-1 event starts)")
+with col4:
+    if np.isfinite(today_force):
+        delta_today = (today_force - baseline) * 100 if np.isfinite(baseline) else None
+        st.metric("Today's Force", f"{today_force*100:.1f}%",
+                 delta=f"{delta_today:+.1f}pp" if delta_today else None)
+    else:
+        st.metric("Today's Force", "N/A")
+    
+    st.metric("Latest Date", str(today["Date"]))
+
+with col5:
+    latest_price = float(df_all.iloc[-1]["Close"])
+    prev_price = float(df_all.iloc[-2]["Close"]) if len(df_all) > 1 else latest_price
+    price_change = ((latest_price / prev_price) - 1) * 100
+    st.metric("Latest Price", f"${latest_price:.2f}", 
+             delta=f"{price_change:+.2f}%")
+    
+    if 'trend' in df_all.columns:
+        trend = df_all.iloc[-1]['trend']
+        st.metric("Trend (EMA200)", trend)
+
+# -------------------- Main Chart --------------------
+st.markdown("---")
+st.markdown("### 📈 Price & Force Analysis")
+
+hit_dates = occ["Date"].tolist() if len(occ) else []
+main_chart = create_main_chart(df_all, hit_dates, side, symbol)
+st.plotly_chart(main_chart, use_container_width=True)
+
+# -------------------- Force Breakdown & Performance --------------------
+st.markdown("---")
+col_left, col_right = st.columns([1, 1])
+
+with col_left:
+    st.markdown("### 🔍 Today's Force Breakdown")
+    if today_breakdown:
+        breakdown_chart = create_force_breakdown_chart(today_breakdown)
+        if breakdown_chart:
+            st.plotly_chart(breakdown_chart, use_container_width=True)
+        
+        # Show detailed table
+        with st.expander("📋 Detailed Breakdown Table"):
+            bd_df = pd.DataFrame(today_breakdown)
+            bd_df['lift_pp'] = bd_df['lift_pp'].round(2)
+            bd_df['weight'] = bd_df['weight'].round(3)
+            st.dataframe(bd_df, use_container_width=True, height=300)
+    else:
+        st.info("ℹ️ No contributing placements met min_n threshold. Force score equals baseline.")
+
+with col_right:
+    st.markdown("### 🎯 Performance Heatmap")
+    if len(occ) > 0:
+        perf_heatmap = create_performance_heatmap(occ)
+        if perf_heatmap:
+            st.plotly_chart(perf_heatmap, use_container_width=True)
+        else:
+            st.info("ℹ️ Insufficient data for heatmap visualization.")
+    else:
+        st.info("ℹ️ Select planetary filters to see performance patterns.")
+
+# -------------------- Historical Occurrences --------------------
+st.markdown("---")
+st.markdown("### 📚 Historical Occurrences Analysis")
+
 if len(occ) == 0:
-    st.info("No historical matches for the selected combo (with current robustness threshold).")
+    st.info("ℹ️ No historical matches for the selected combo. Adjust filters or reduce min_n threshold.")
 else:
+    # Calculate forward returns
     px = df_all.set_index("Date")
-
+    
     def fwd_ret(d, h):
         if d not in px.index:
             return np.nan
@@ -506,52 +646,212 @@ else:
         c0 = float(px.iloc[i]["Close"])
         c1 = float(px.iloc[j]["Close"])
         return (c1 / c0 - 1.0) * 100.0
-
+    
     occ = occ.sort_values("Date", ascending=False).copy()
     for h in [1, 3, 5, 10]:
         occ[f"ret_{h}d_pct"] = occ["Date"].apply(lambda d: fwd_ret(d, h))
+    
+    # Summary statistics
+    st.markdown("#### Summary Statistics")
+    sum_col1, sum_col2, sum_col3, sum_col4 = st.columns(4)
+    
+    with sum_col1:
+        win_rate = float(occ["y_revert"].mean() * 100) if len(occ) else 0
+        st.metric("Win Rate", f"{win_rate:.1f}%")
+    
+    with sum_col2:
+        avg_1d = float(occ["ret_1d_pct"].mean()) if "ret_1d_pct" in occ.columns else 0
+        st.metric("Avg 1-Day Return", f"{avg_1d:.2f}%")
+    
+    with sum_col3:
+        avg_5d = float(occ["ret_5d_pct"].mean()) if "ret_5d_pct" in occ.columns else 0
+        st.metric("Avg 5-Day Return", f"{avg_5d:.2f}%")
+    
+    with sum_col4:
+        avg_10d = float(occ["ret_10d_pct"].mean()) if "ret_10d_pct" in occ.columns else 0
+        st.metric("Avg 10-Day Return", f"{avg_10d:.2f}%")
+    
+    # Detailed table
+    st.markdown("#### Event Details")
+    
+    # Select columns to display
+    base_cols = ["Date", "ext_dir", "y_revert"]
+    planet_cols = [c for c in FEATURES if c in occ.columns]
+    ret_cols = ["ret_1d_pct", "ret_3d_pct", "ret_5d_pct", "ret_10d_pct"]
+    
+    display_cols = base_cols + planet_cols + ret_cols
+    view = occ[display_cols].copy()
+    
+    # Format return columns
+    for c in ret_cols:
+        if c in view.columns:
+            view[c] = view[c].round(2)
+    
+    # Add filters
+    col_filter1, col_filter2 = st.columns(2)
+    with col_filter1:
+        show_winners_only = st.checkbox("Show winners only (y_revert=1)")
+    with col_filter2:
+        min_return = st.number_input("Min 5-day return %", value=-100.0, step=1.0)
+    
+    filtered_view = view.copy()
+    if show_winners_only:
+        filtered_view = filtered_view[filtered_view["y_revert"] == 1]
+    if "ret_5d_pct" in filtered_view.columns:
+        filtered_view = filtered_view[filtered_view["ret_5d_pct"] >= min_return]
+    
+    st.dataframe(filtered_view, use_container_width=True, height=400)
+    
+    # Download button
+    csv = filtered_view.to_csv(index=False)
+    st.download_button(
+        label="📥 Download filtered data as CSV",
+        data=csv,
+        file_name=f"planetary_force_{symbol}_{side}.csv",
+        mime="text/csv"
+    )
 
-    # Show key columns + whichever features exist
-    cols_show = ["Date", "ext_dir", "y_revert"] + [c for c in FEATURES if c in occ.columns] + ["ret_1d_pct","ret_3d_pct","ret_5d_pct","ret_10d_pct"]
-    view = occ[cols_show].copy()
-    for c in ["ret_1d_pct","ret_3d_pct","ret_5d_pct","ret_10d_pct"]:
-        view[c] = view[c].map(lambda x: round(float(x), 3) if np.isfinite(x) else np.nan)
+# -------------------- Active Combo Display --------------------
+if combo:
+    st.markdown("---")
+    st.markdown("### 🌙 Active Planetary Filter")
+    combo_display = {}
+    for k, v in combo.items():
+        if isinstance(v, list):
+            combo_display[k] = ", ".join(map(str, v))
+        else:
+            combo_display[k] = str(v)
+    
+    cols = st.columns(len(combo_display))
+    for i, (key, val) in enumerate(combo_display.items()):
+        with cols[i]:
+            st.info(f"**{key}**\n\n{val}")
 
-    st.dataframe(view, use_container_width=True, height=420)
+# -------------------- Future Scan --------------------
+st.markdown("---")
+st.markdown("### 🔮 Future Force Predictions")
 
-# -------------------- Minimal future scan (top K + breakdown) --------------------
-st.subheader("Future force (top dates)")
-start = datetime.now(tz=UTC).date()
-future_dates = [start + timedelta(days=i) for i in range(1, future_days + 1)]
-df_future = compute_astro(future_dates)
+with st.spinner("Calculating future planetary positions..."):
+    start = datetime.now(tz=UTC).date()
+    future_dates = [start + timedelta(days=i) for i in range(1, future_days + 1)]
+    df_future = compute_astro(future_dates)
 
 if df_future.empty or not np.isfinite(baseline):
-    st.info("Future scan unavailable (missing baseline or astro data).")
+    st.warning("⚠️ Future scan unavailable (missing baseline or astro data).")
 else:
     scores = []
     breakdown_map = {}
+    
     for _, r in df_future.iterrows():
         p, bd = force_score(r, brain, side=side, k_shrink=k_shrink)
         scores.append(p)
         breakdown_map[r["Date"]] = bd
-
+    
     df_future = df_future.copy()
     df_future["pred_prob"] = scores
+    df_future["lift_from_baseline"] = (df_future["pred_prob"] - baseline) * 100
+    
+    # Show top predictions
     top = df_future.sort_values("pred_prob", ascending=False).head(top_k).copy()
-
-    st.dataframe(
-        top[["Date","pred_prob","Moon_sign","Mercury_sign","Venus_sign","Mars_sign","Jupiter_sign","Saturn_sign","Phase","Mercury_retro","Moon_Node"]],
-        use_container_width=True
+    
+    st.markdown(f"#### Top {top_k} Dates by Force Score")
+    
+    # Display top dates with metrics
+    top_cols = st.columns(min(top_k, 5))
+    for i, (_, row) in enumerate(top.head(5).iterrows()):
+        with top_cols[i]:
+            delta_val = float(row["lift_from_baseline"])
+            st.metric(
+                str(row["Date"]),
+                f"{row['pred_prob']*100:.1f}%",
+                delta=f"{delta_val:+.1f}pp"
+            )
+    
+    # Detailed table
+    display_future_cols = ["Date", "pred_prob", "lift_from_baseline", "Moon_sign", "Mercury_sign", 
+                          "Venus_sign", "Mars_sign", "Jupiter_sign", "Saturn_sign", 
+                          "Phase", "Mercury_retro", "Moon_Node"]
+    
+    future_display = top[[c for c in display_future_cols if c in top.columns]].copy()
+    future_display["pred_prob"] = (future_display["pred_prob"] * 100).round(1)
+    future_display["lift_from_baseline"] = future_display["lift_from_baseline"].round(1)
+    
+    st.dataframe(future_display, use_container_width=True)
+    
+    # Timeline chart of future force scores
+    st.markdown("#### Future Force Score Timeline")
+    
+    future_chart = go.Figure()
+    
+    future_chart.add_trace(go.Scatter(
+        x=df_future["Date"].astype(str),
+        y=df_future["pred_prob"] * 100,
+        mode="lines+markers",
+        name="Predicted Force",
+        line=dict(color='#667eea', width=3),
+        marker=dict(size=6)
+    ))
+    
+    future_chart.add_hline(
+        y=baseline * 100,
+        line_dash="dash",
+        line_color="gray",
+        annotation_text="Baseline"
     )
-
-    if len(top):
-        chosen = st.selectbox("Inspect breakdown for date", top["Date"].astype(str).tolist(), index=0)
+    
+    # Highlight top K dates
+    for _, row in top.iterrows():
+        future_chart.add_vline(
+            x=str(row["Date"]),
+            line_dash="dot",
+            line_color="rgba(255,0,0,0.3)",
+            line_width=2
+        )
+    
+    future_chart.update_layout(
+        title="Predicted Force Scores (Next " + str(future_days) + " Days)",
+        xaxis_title="Date",
+        yaxis_title="Force Score (%)",
+        height=400,
+        hovermode='x unified',
+        plot_bgcolor='#f8f9fa',
+        paper_bgcolor='white'
+    )
+    
+    st.plotly_chart(future_chart, use_container_width=True)
+    
+    # Breakdown inspector
+    st.markdown("#### Inspect Date Breakdown")
+    chosen = st.selectbox(
+        "Select a date to see force breakdown:",
+        top["Date"].astype(str).tolist(),
+        index=0
+    )
+    
+    if chosen:
         chosen_date = datetime.strptime(chosen, "%Y-%m-%d").date()
         bd = breakdown_map.get(chosen_date, [])
+        
         if not bd:
-            st.info("No contributing placements met min_n for this date. Score = baseline.")
+            st.info("ℹ️ No contributing placements met min_n for this date. Score = baseline.")
         else:
-            bdf = pd.DataFrame(bd)
-            bdf["lift_pp"] = bdf["lift_pp"].map(lambda x: round(float(x), 2))
-            bdf["weight"] = bdf["weight"].map(lambda x: round(float(x), 3))
-            st.dataframe(bdf, use_container_width=True, height=300)
+            # Show breakdown chart
+            bd_chart = create_force_breakdown_chart(bd)
+            if bd_chart:
+                st.plotly_chart(bd_chart, use_container_width=True)
+            
+            # Show breakdown table
+            with st.expander("📋 Detailed Breakdown"):
+                bdf = pd.DataFrame(bd)
+                bdf["lift_pp"] = bdf["lift_pp"].round(2)
+                bdf["weight"] = bdf["weight"].round(3)
+                st.dataframe(bdf, use_container_width=True, height=300)
+
+# -------------------- Footer --------------------
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: #666; padding: 20px;'>
+    <p>🌟 Planetary Force Analytics Dashboard</p>
+    <p style='font-size: 0.9em;'>Combining technical analysis with planetary positions for market insights</p>
+</div>
+""", unsafe_allow_html=True)
