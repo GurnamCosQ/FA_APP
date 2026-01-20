@@ -1,6 +1,6 @@
 streamlit
 yfinance
-swisseph
+pyswisseph
 plotly
 pandas
 numpy
