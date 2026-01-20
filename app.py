@@ -258,8 +258,7 @@ def create_main_chart(df: pd.DataFrame, hit_dates: list, side: str, symbol: str)
     fig = make_subplots(
         rows=4, cols=1,
         shared_xaxis=True,
-        vertical_spacing=0.03,
-        row_heights=[0.5, 0.15, 0.20, 0.15]
+        vertical_spacing=0.05
     )
 
     # Panel 1: Candlestick with BB
