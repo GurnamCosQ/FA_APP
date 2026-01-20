@@ -259,11 +259,7 @@ def create_main_chart(df: pd.DataFrame, hit_dates: list, side: str, symbol: str)
         rows=4, cols=1,
         shared_xaxis=True,
         vertical_spacing=0.03,
-        row_heights=[0.5, 0.15, 0.20, 0.15],
-        specs=[[{"type": "candlestick"}],
-               [{"type": "bar"}],
-               [{"type": "scatter"}],
-               [{"type": "scatter"}]]
+        row_heights=[0.5, 0.15, 0.20, 0.15]
     )
 
     # Panel 1: Candlestick with BB
