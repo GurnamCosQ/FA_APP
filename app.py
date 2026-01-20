@@ -9,13 +9,12 @@ from zoneinfo import ZoneInfo
 
 # ============================================================
 # Planetary Edge Finder (Correct bifurcation)
-#   FAST planets -> Level-1 overextension events -> "reversion-to-mean" success
-#   SLOW planets (Jupiter/Saturn/Rahu/Ketu) -> daily regime vs EMA200 -> trend bias
+#   FAST planets -> Level-1 overextension events -> reversion success
+#   SLOW planets (Jupiter/Saturn/Rahu/Ketu) -> EMA200 regime -> trend bias
 # ============================================================
 
 # -------------------- Page / Style --------------------
 st.set_page_config(page_title="Planetary Edge Finder", layout="wide")
-
 st.markdown(
     """
 <style>
@@ -38,7 +37,6 @@ st.markdown(
 .bg-yellow{ background: #f59e0b; }
 .bg-red   { background: #ef4444; }
 .smallmuted { color: #6b7280; font-size: 13px; }
-.kpi-title { color:#6b7280; font-size:12px; }
 </style>
 """,
     unsafe_allow_html=True,
@@ -58,7 +56,7 @@ ASSET_PRESETS = {
     "S&P 500 (^GSPC)": "^GSPC",
 }
 
-# Swiss Ephemeris (Lahiri sidereal) — required for your deployment
+# Swiss Ephemeris (Lahiri sidereal)
 swe.set_sid_mode(swe.SIDM_LAHIRI)
 
 # FAST features for event/reversion analysis
@@ -67,7 +65,7 @@ FAST_FEATURES = [
     "Phase", "Mercury_retro", "Moon_Node",
 ]
 
-# SLOW features for trend/EMA200 analysis (as per your bifurcation)
+# SLOW features for trend/EMA200 analysis
 SLOW_FEATURES = [
     "Jupiter_sign", "Saturn_sign", "Rahu_sign", "Ketu_sign",
     "Jupiter_retro", "Saturn_retro",
@@ -81,13 +79,11 @@ def sign_from_lon(lon_deg: float) -> str:
     return SIGNS[int((lon_deg % 360.0) // 30)]
 
 def julday_fast(d, hour_ist: int = 10) -> float:
-    # FAST convention: 10:00 IST -> UTC
     dt_local = datetime(d.year, d.month, d.day, hour_ist, 0, 0, tzinfo=IST)
     dt_utc = dt_local.astimezone(UTC)
     return swe.julday(dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour + dt_utc.minute/60.0 + dt_utc.second/3600.0)
 
 def julday_slow(d, hour_utc: int = 12) -> float:
-    # SLOW convention: 12:00 UTC
     dt_utc = datetime(d.year, d.month, d.day, hour_utc, 0, 0, tzinfo=UTC)
     return swe.julday(dt_utc.year, dt_utc.month, dt_utc.day, dt_utc.hour)
 
@@ -105,10 +101,6 @@ def sign_distance(a: str, b: str) -> int:
     return min(d, 12 - d)
 
 def verdict_class_from_edge(edge_pp: float, n: int, min_n: int) -> tuple[str, str]:
-    """
-    edge_pp = (p_cond - p_base)*100 in percentage-points.
-    Provide a simple banding + respect min_n.
-    """
     if n < min_n:
         return "INSUFFICIENT SAMPLE", "bg-red"
     if edge_pp >= 10:
@@ -135,17 +127,32 @@ def match_combo(df: pd.DataFrame, combo: dict) -> pd.Series:
             m &= (df[feat] == val)
     return m
 
-# -------------------- Data fetch / normalization (Streamlit Cloud-safe) --------------------
+def contiguous_blocks(mask: pd.Series) -> list[tuple[int,int]]:
+    arr = mask.fillna(False).astype(bool).values
+    idx = np.where(arr)[0]
+    if len(idx) == 0:
+        return []
+    blocks = []
+    start = idx[0]
+    prev = idx[0]
+    for i in idx[1:]:
+        if i == prev + 1:
+            prev = i
+        else:
+            blocks.append((start, prev))
+            start = i
+            prev = i
+    blocks.append((start, prev))
+    return blocks
+
+# -------------------- Data fetch / normalization --------------------
 @st.cache_data(show_spinner=False)
 def fetch_price(symbol: str, period: str, interval: str = "1d") -> pd.DataFrame:
     raw = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False)
-
     if raw is None or len(raw) == 0:
         return pd.DataFrame(columns=["Date","Open","High","Low","Close","Volume"])
-
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
-
     df = raw.reset_index().copy()
 
     # yfinance might use Date or Datetime
@@ -159,9 +166,9 @@ def fetch_price(symbol: str, period: str, interval: str = "1d") -> pd.DataFrame:
     df = df.rename(columns={dt_col: "Date"})
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
     df = df[pd.notna(df["Date"])].copy()
-
     return df
 
+# -------------------- Tech computations --------------------
 def compute_tech_fast_events(
     df_px: pd.DataFrame,
     bb_w: int,
@@ -170,12 +177,8 @@ def compute_tech_fast_events(
     lookahead: int,
     stopout: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    FAST logic (Gemini):
-      - Overextension streak starts => Level-1 events
-      - y_revert success if price returns to MA20 before stopout extension
-    """
     df = df_px.copy()
+
     df["TP"] = (df["High"] + df["Low"]) / 2.0
     df["MA20"] = df["TP"].rolling(bb_w).mean()
     df["STD20"] = df["TP"].rolling(bb_w).std()
@@ -226,10 +229,6 @@ def compute_tech_fast_events(
     return df, events
 
 def compute_tech_slow_trend(df_px: pd.DataFrame) -> pd.DataFrame:
-    """
-    SLOW logic (Long planets):
-      - Trend label based on EMA200 regime
-    """
     df = df_px.copy()
     df["ema200"] = df["Close"].ewm(span=200, adjust=False).mean()
     df["trend"] = np.where(df["Close"] >= df["ema200"], "UP", "DOWN")
@@ -264,7 +263,7 @@ def compute_astro(dates: list) -> pd.DataFrame:
         phase_angle = (moon_lon - sun_lon) % 360.0
         phase = "Waxing" if phase_angle < 180.0 else "Waning"
 
-        # SLOW planets (and nodes) computed at slow-time for regime consistency
+        # nodes at slow-time for regime consistency
         rahu_lon, _ = sidereal_lon_speed(jd_s, swe.MEAN_NODE)
         ketu_lon = (rahu_lon + 180.0) % 360.0
 
@@ -312,148 +311,146 @@ def compute_astro(dates: list) -> pd.DataFrame:
             out[c] = np.nan
     return out[cols]
 
-# -------------------- Metrics tables --------------------
-def discovery_table_fast(events_side: pd.DataFrame, min_n: int) -> pd.DataFrame:
-    """
-    For FAST event analysis:
-      baseline = P(revert) on event days for a given side (U or D).
-      For each feature/value:
-         P(revert|feature=value), n, lift_pp = (p_cond - baseline)*100
-    """
+# -------------------- Discovery / lift lookup tables --------------------
+def lift_lookup_fast(events_side: pd.DataFrame, min_n_events: int) -> tuple[float, dict, pd.DataFrame]:
     base = float(events_side["y_revert"].mean())
     rows = []
-    for feat in FAST_FEATURES + ["Rahu_sign","Ketu_sign"]:  # allow nodes to be used as event filters if desired
+    lk = {}
+    for feat in FAST_FEATURES + ["Rahu_sign","Ketu_sign"]:
         if feat not in events_side.columns:
             continue
-        for val, sub in events_side.groupby(feat):
+        g = events_side.groupby(feat)["y_revert"].agg(["count","mean"]).reset_index()
+        for _, r in g.iterrows():
+            val = r[feat]
             if pd.isna(val):
                 continue
-            n = len(sub)
-            if n < min_n:
+            n = int(r["count"])
+            if n < min_n_events:
                 continue
-            p = float(sub["y_revert"].mean())
-            rows.append({
-                "Feature": feat,
-                "Value": val,
-                "n_events": n,
-                "P(revert|value)": p,
-                "Lift_vs_baseline_pp": (p - base) * 100.0,
-            })
-    df = pd.DataFrame(rows)
-    if len(df) == 0:
-        return df
-    return df.sort_values(["Lift_vs_baseline_pp","n_events"], ascending=[False, False]).reset_index(drop=True)
+            p = float(r["mean"])
+            lift_pp = (p - base) * 100.0
+            lk[(feat, val)] = {"n": n, "p": p, "lift_pp": lift_pp}
+            rows.append({"Feature": feat, "Value": val, "n_events": n, "P(revert|value)": p, "Lift_vs_baseline_pp": lift_pp})
+    df = pd.DataFrame(rows).sort_values(["Lift_vs_baseline_pp","n_events"], ascending=[False, False]).reset_index(drop=True) if rows else pd.DataFrame()
+    return base, lk, df
 
-def discovery_table_slow(df_trend: pd.DataFrame, min_n: int) -> pd.DataFrame:
-    """
-    For SLOW trend analysis:
-      baseline = P(UP) over all days.
-      For each feature/value:
-         P(UP|feature=value), n, lift_up_pp = (p_up_cond - baseline_up)*100
-      Also show P(DOWN|value) for readability.
-    """
+def lift_lookup_slow(df_trend: pd.DataFrame, min_n_days: int) -> tuple[float, dict, pd.DataFrame]:
     base_up = float(df_trend["is_uptrend"].mean())
     rows = []
+    lk = {}
     for feat in SLOW_FEATURES:
         if feat not in df_trend.columns:
             continue
-        for val, sub in df_trend.groupby(feat):
+        g = df_trend.groupby(feat).agg(n_days=("Date","count"), p_up=("is_uptrend","mean"), p_dn=("is_downtrend","mean")).reset_index()
+        for _, r in g.iterrows():
+            val = r[feat]
             if pd.isna(val):
                 continue
-            n = len(sub)
-            if n < min_n:
+            n = int(r["n_days"])
+            if n < min_n_days:
                 continue
-            p_up = float(sub["is_uptrend"].mean())
-            p_dn = float(sub["is_downtrend"].mean())
-            rows.append({
-                "Feature": feat,
-                "Value": val,
-                "n_days": n,
-                "P(UP|value)": p_up,
-                "P(DOWN|value)": p_dn,
-                "Lift_UP_vs_baseline_pp": (p_up - base_up) * 100.0,
-            })
-    df = pd.DataFrame(rows)
-    if len(df) == 0:
-        return df
-    return df.sort_values(["Lift_UP_vs_baseline_pp","n_days"], ascending=[False, False]).reset_index(drop=True)
+            p_up = float(r["p_up"])
+            p_dn = float(r["p_dn"])
+            lift_pp = (p_up - base_up) * 100.0
+            lk[(feat, val)] = {"n": n, "p_up": p_up, "p_dn": p_dn, "lift_pp": lift_pp}
+            rows.append({"Feature": feat, "Value": val, "n_days": n, "P(UP|value)": p_up, "P(DOWN|value)": p_dn, "Lift_UP_vs_baseline_pp": lift_pp})
+    df = pd.DataFrame(rows).sort_values(["Lift_UP_vs_baseline_pp","n_days"], ascending=[False, False]).reset_index(drop=True) if rows else pd.DataFrame()
+    return base_up, lk, df
 
 # -------------------- Charting --------------------
-def add_sign_zone(fig, df: pd.DataFrame, feat: str, value):
-    """
-    Shade contiguous ranges where df[feat] == value.
-    """
-    if feat not in df.columns:
-        return
-    mask = (df[feat] == value).fillna(False).values
-    idx = np.where(mask)[0]
-    if len(idx) == 0:
-        return
-    blocks = []
-    start = idx[0]
-    prev = idx[0]
-    for i in idx[1:]:
-        if i == prev + 1:
-            prev = i
-        else:
-            blocks.append((start, prev))
-            start = i
-            prev = i
-    blocks.append((start, prev))
-    for a, b in blocks:
-        x0 = str(df.loc[a, "Date"])
-        x1 = str(df.loc[b, "Date"])
-        fig.add_vrect(x0=x0, x1=x1, opacity=0.14, line_width=0)
-
-def plot_price(df: pd.DataFrame, title: str, show_bb: bool, show_ema200: bool, vlines: list, zones: list):
-    """
-    zones: list of (feat, value)
-    vlines: list of dict {date, kind, outcome?}
-    """
+def plot_slice(df_slice: pd.DataFrame, title: str, show_bb: bool, show_ema200: bool, vlines: list | None = None):
     fig = go.Figure()
 
     fig.add_trace(go.Candlestick(
-        x=df["Date"].astype(str),
-        open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+        x=df_slice["Date"].astype(str),
+        open=df_slice["Open"], high=df_slice["High"], low=df_slice["Low"], close=df_slice["Close"],
         name="Price"
     ))
 
-    if show_bb and all(c in df.columns for c in ["MA20","Upper","Lower"]):
-        fig.add_trace(go.Scatter(x=df["Date"].astype(str), y=df["MA20"], mode="lines", name="MA20"))
-        fig.add_trace(go.Scatter(x=df["Date"].astype(str), y=df["Upper"], mode="lines", name="Upper"))
-        fig.add_trace(go.Scatter(x=df["Date"].astype(str), y=df["Lower"], mode="lines", name="Lower"))
+    if show_bb and all(c in df_slice.columns for c in ["MA20","Upper","Lower"]):
+        fig.add_trace(go.Scatter(x=df_slice["Date"].astype(str), y=df_slice["MA20"], mode="lines", name="MA20"))
+        fig.add_trace(go.Scatter(x=df_slice["Date"].astype(str), y=df_slice["Upper"], mode="lines", name="Upper"))
+        fig.add_trace(go.Scatter(x=df_slice["Date"].astype(str), y=df_slice["Lower"], mode="lines", name="Lower"))
 
-    if show_ema200 and "ema200" in df.columns:
-        fig.add_trace(go.Scatter(x=df["Date"].astype(str), y=df["ema200"], mode="lines", name="EMA200"))
+    if show_ema200 and "ema200" in df_slice.columns:
+        fig.add_trace(go.Scatter(x=df_slice["Date"].astype(str), y=df_slice["ema200"], mode="lines", name="EMA200"))
 
-    for feat, val in zones:
-        add_sign_zone(fig, df, feat, val)
-
-    # vlines: red/green for outcomes when available
-    for x in vlines:
-        d = x.get("date")
-        if d is None:
-            continue
-        if x.get("outcome") is None:
-            fig.add_vline(x=str(d), opacity=0.25, line_width=1)
-        else:
-            # 1 = win (green), 0 = loss (red)
-            color = "#10b981" if int(x["outcome"]) == 1 else "#ef4444"
-            fig.add_vline(x=str(d), opacity=0.45, line_width=2, line_color=color)
+    if vlines:
+        for x in vlines:
+            d = x.get("date")
+            if d is None:
+                continue
+            if x.get("outcome") is None:
+                fig.add_vline(x=str(d), opacity=0.25, line_width=1)
+            else:
+                color = "#10b981" if int(x["outcome"]) == 1 else "#ef4444"
+                fig.add_vline(x=str(d), opacity=0.45, line_width=2, line_color=color)
 
     fig.update_layout(
         title=title,
-        height=650,
+        height=420,
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
     )
     st.plotly_chart(fig, use_container_width=True)
 
+def plot_future_lifts(df_future: pd.DataFrame, base_prob: float, lk: dict, feature_list: list, title_prefix: str, prob_label: str):
+    """
+    df_future includes Date + features.
+    lk[(feat, value)] -> {lift_pp, n, ...}
+    """
+    if df_future.empty:
+        st.info("No future dates available.")
+        return
+
+    # Build timeseries of lift per feature for that day's active value
+    out = pd.DataFrame({"Date": df_future["Date"]})
+    for feat in feature_list:
+        vals = df_future[feat] if feat in df_future.columns else pd.Series([np.nan]*len(df_future))
+        lifts = []
+        for v in vals.tolist():
+            if (feat, v) in lk:
+                lifts.append(float(lk[(feat, v)]["lift_pp"]))
+            else:
+                lifts.append(0.0)
+        out[feat] = lifts
+
+    # Total force = baseline + sum of lifts (pp)/100
+    out["TotalLift_pp"] = out[feature_list].sum(axis=1)
+    out["ForceProb"] = np.clip(base_prob + out["TotalLift_pp"]/100.0, 0.0, 1.0)
+
+    # Chart 1: Force probability
+    fig1 = go.Figure()
+    fig1.add_trace(go.Scatter(x=out["Date"].astype(str), y=out["ForceProb"], mode="lines", name=prob_label))
+    fig1.add_hline(y=base_prob, line_dash="dash", opacity=0.5)
+    fig1.update_layout(
+        title=f"{title_prefix} — Total Force (baseline + summed lifts)",
+        height=360,
+        xaxis_title="Date",
+        yaxis_title=prob_label,
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig1, use_container_width=True)
+
+    # Chart 2: Lift lines per feature
+    fig2 = go.Figure()
+    for feat in feature_list:
+        fig2.add_trace(go.Scatter(x=out["Date"].astype(str), y=out[feat], mode="lines", name=feat))
+    fig2.add_trace(go.Scatter(x=out["Date"].astype(str), y=out["TotalLift_pp"], mode="lines", name="TotalLift_pp"))
+    fig2.update_layout(
+        title=f"{title_prefix} — Lift contribution by placement (pp)",
+        height=420,
+        xaxis_title="Date",
+        yaxis_title="Lift (percentage-points)",
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
 # ============================================================
 # UI
 # ============================================================
 st.title("Planetary Edge Finder")
-st.caption("FAST planets: peaks/bottoms episodes (Level-1) • SLOW planets (Jupiter/Saturn/Rahu/Ketu): EMA200 trend regimes")
+st.caption("FAST planets: peaks/bottoms episodes (Level-1) • SLOW planets: EMA200 trend regimes")
 
 with st.sidebar:
     st.header("Asset")
@@ -462,7 +459,6 @@ with st.sidebar:
     symbol = st.text_input("Or type Yahoo symbol", value=symbol_default).strip() or symbol_default
 
     st.header("History")
-    # As far back as possible by default
     period = st.selectbox("Period", ["max", "20y", "10y", "5y", "2y"], index=0)
     interval = "1d"
 
@@ -475,34 +471,34 @@ with st.sidebar:
 
     st.header("Robustness")
     min_n_events = st.slider("FAST min events (n)", 5, 80, 15)
-    min_n_days = st.slider("SLOW min days (n)", 50, 1200, 200)
+    min_n_days = st.slider("SLOW min days (n)", 50, 1600, 200)
 
-    st.header("Chart overlays")
-    show_bb = st.checkbox("Show Bollinger thresholds (MA20/Upper/Lower)", value=True)
-    show_ema = st.checkbox("Show EMA200", value=True)
+    st.header("Charting")
+    show_bb = st.checkbox("Show Bollinger thresholds (FAST charts)", value=True)
+    show_ema = st.checkbox("Show EMA200 (SLOW charts)", value=True)
+    max_occ_charts = st.slider("Max occurrence charts to render", 5, 80, 25)
 
-tabs = st.tabs(["FAST: Reversion Edge (Peaks/Bottoms)", "SLOW: Trend Edge (EMA200 Regime)"])
+tabs = st.tabs(["FAST: Reversion Edge (Level-1)", "SLOW: Trend Edge (EMA200)", "Future Force"])
 
 # ============================================================
-# Load data once (shared)
+# Load shared data
 # ============================================================
 with st.spinner("Loading market data…"):
     df_px = fetch_price(symbol, period, interval)
 
 if df_px.empty:
-    st.error("No price data returned. Try a different symbol or a smaller period.")
+    st.error("No price data returned. Try a different symbol or smaller period.")
     st.stop()
 
-# Compute shared astro once over all dates
 with st.spinner("Computing astro features…"):
     df_astro = compute_astro(df_px["Date"].tolist())
 
-# -------------------- FAST prep --------------------
+# FAST prep
 df_fast_all, events = compute_tech_fast_events(df_px, bb_w, bb_k, margin, lookahead, stopout)
 df_fast_all = df_fast_all.merge(df_astro, on="Date", how="left")
 events = events.merge(df_astro, on="Date", how="left")
 
-# -------------------- SLOW prep --------------------
+# SLOW prep
 df_slow_all = compute_tech_slow_trend(df_px)
 df_slow_all = df_slow_all.merge(df_astro, on="Date", how="left")
 
@@ -511,82 +507,92 @@ df_slow_all = df_slow_all.merge(df_astro, on="Date", how="left")
 # ============================================================
 with tabs[0]:
     st.subheader("FAST: Reversion Edge on Level-1 Overextension Events")
-
     st.markdown(
         """
-**What is measured here (FAST planets)?**
-- We only look at **Level-1 overextension starts** (first day price pushes beyond the adjusted Bollinger threshold).
-- Each event is labeled **WIN (1)** if price returns to **MA20** within your lookahead window *before* a stop-out extension.
-- This measures: **“When a peak/bottom episode starts, does it mean-revert?”**
+**Meaning**
+- We only evaluate **event starts** (first day of an overextension streak).
+- A **WIN** means price returns to MA20 within the lookahead window before the stop-out extension.
+- This is measuring **peak/bottom episode mean-reversion**, not slow-trend direction.
 """
     )
 
-    c0, c1, c2 = st.columns([1, 1, 2])
-    with c0:
+    colA, colB = st.columns([1, 2])
+    with colA:
         side = st.radio("Event side", ["U", "D"], horizontal=True)
-    with c1:
-        show_outcome_lines = st.checkbox("Color event lines by outcome (green=win/red=loss)", value=True)
-    with c2:
+    with colB:
         st.markdown(
             """
 <div class="smallmuted">
 U = overextension above Upper threshold (peaky zone).<br>
 D = overextension below Lower threshold (bottomy zone).<br>
-“Lift” is shown in percentage-points vs the baseline for the chosen side.
+Lift is reported in <b>percentage-points</b> vs the baseline for this side.
 </div>
 """,
             unsafe_allow_html=True,
         )
 
-    # Filter to selected side and valid labels
     events_side = events[(events["ext_dir"] == side) & pd.notna(events["y_revert"])].copy()
     if len(events_side) == 0:
         st.error("No labeled events found for this side with current settings.")
         st.stop()
 
-    baseline = float(events_side["y_revert"].mean())
-    baseline_n = int(len(events_side))
+    base_fast, lk_fast, disc_fast = lift_lookup_fast(events_side, min_n_events=min_n_events)
 
-    # FAST combo builder
-    with st.expander("FAST combo builder (optional)", expanded=True):
-        colA, colB, colC, colD = st.columns(4)
-        with colA:
+    # Combo builder (FAST + optional node filters)
+    with st.expander("FAST combo builder (placements)", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
             moon_signs = st.multiselect("Moon sign", SIGNS, default=[])
-        with colB:
+        with c2:
             merc_signs = st.multiselect("Mercury sign", SIGNS, default=[])
-        with colC:
-            mars_signs = st.multiselect("Mars sign", SIGNS, default=[])
-        with colD:
+        with c3:
             venus_signs = st.multiselect("Venus sign", SIGNS, default=[])
+        with c4:
+            mars_signs = st.multiselect("Mars sign", SIGNS, default=[])
 
-        colE, colF, colG = st.columns(3)
-        with colE:
+        c5, c6, c7, c8 = st.columns(4)
+        with c5:
             phases = st.multiselect("Phase", ["Waxing", "Waning"], default=[])
-        with colF:
-            merc_retro = st.selectbox("Mercury retro", ["Any", "True", "False"], index=0)
-        with colG:
+        with c6:
             moon_node = st.multiselect("Moon-Node", ["Conjunct", "None"], default=[])
+        with c7:
+            merc_retro = st.selectbox("Mercury retro", ["Any", "True", "False"], index=0)
+        with c8:
+            include_nodes = st.checkbox("Include Rahu/Ketu sign filters", value=False)
 
-        fast_combo = {}
-        if moon_signs: fast_combo["Moon_sign"] = moon_signs
-        if merc_signs: fast_combo["Mercury_sign"] = merc_signs
-        if mars_signs: fast_combo["Mars_sign"] = mars_signs
-        if venus_signs: fast_combo["Venus_sign"] = venus_signs
-        if phases: fast_combo["Phase"] = phases
-        if moon_node: fast_combo["Moon_Node"] = moon_node
-        if merc_retro != "Any":
-            fast_combo["Mercury_retro"] = (merc_retro == "True")
+        rahu_signs = []
+        ketu_signs = []
+        if include_nodes:
+            c9, c10 = st.columns(2)
+            with c9:
+                rahu_signs = st.multiselect("Rahu sign", SIGNS, default=[])
+            with c10:
+                ketu_signs = st.multiselect("Ketu sign", SIGNS, default=[])
 
-    # Apply combo
+    fast_combo = {}
+    if moon_signs: fast_combo["Moon_sign"] = moon_signs
+    if merc_signs: fast_combo["Mercury_sign"] = merc_signs
+    if venus_signs: fast_combo["Venus_sign"] = venus_signs
+    if mars_signs: fast_combo["Mars_sign"] = mars_signs
+    if phases: fast_combo["Phase"] = phases
+    if moon_node: fast_combo["Moon_Node"] = moon_node
+    if merc_retro != "Any":
+        fast_combo["Mercury_retro"] = (merc_retro == "True")
+    if include_nodes:
+        if rahu_signs: fast_combo["Rahu_sign"] = rahu_signs
+        if ketu_signs: fast_combo["Ketu_sign"] = ketu_signs
+
+    # Metrics on event-days only
+    baseline_n = int(len(events_side))
     if fast_combo:
-        m = match_combo(events_side, fast_combo)
-        combo_events = events_side[m].copy()
+        m_ev = match_combo(events_side, fast_combo)
+        combo_events = events_side[m_ev].copy()
     else:
         combo_events = events_side.copy()
 
     combo_n = int(len(combo_events))
     combo_p = float(combo_events["y_revert"].mean()) if combo_n else np.nan
-    edge_pp = (combo_p - baseline) * 100.0 if np.isfinite(combo_p) else np.nan
+    edge_pp = (combo_p - base_fast) * 100.0 if np.isfinite(combo_p) else np.nan
 
     verdict_text, verdict_class = verdict_class_from_edge(edge_pp if np.isfinite(edge_pp) else -999, combo_n, min_n_events)
 
@@ -595,125 +601,144 @@ D = overextension below Lower threshold (bottomy zone).<br>
 <div class="big-verdict {verdict_class}">
   <span class="badge">FAST</span>
   <b>{verdict_text}</b><br>
-  Baseline P(revert) for side <b>{side}</b>: <b>{safe_pct(baseline)}</b> (n={baseline_n})<br>
+  Baseline P(revert) for side <b>{side}</b>: <b>{safe_pct(base_fast)}</b> (n={baseline_n})<br>
   Selected combo P(revert): <b>{safe_pct(combo_p)}</b> (n={combo_n}) • Edge: <b>{safe_pp(edge_pp)}</b>
 </div>
 """,
         unsafe_allow_html=True,
     )
 
-    # KPI row
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Baseline P(revert)", safe_pct(baseline))
+    k1.metric("Baseline P(revert)", safe_pct(base_fast))
     k2.metric("Combo P(revert)", safe_pct(combo_p))
     k3.metric("Edge vs baseline", safe_pp(edge_pp))
     k4.metric("Combo n (events)", f"{combo_n}")
 
-    # Chart: full price + BB + EMA200 + vlines on matched events
-    vlines = []
-    if combo_n:
-        for _, r in combo_events.iterrows():
-            vlines.append({
-                "date": r["Date"],
-                "outcome": int(r["y_revert"]) if show_outcome_lines else None
-            })
-
-    # Optional zones (keep simple: allow shading only for a single selected placement)
-    zones = []
-    with st.expander("FAST chart zones (optional)", expanded=False):
-        zone_feat = st.selectbox("Shade where", ["None"] + FAST_FEATURES, index=0)
-        zone_val = None
-        if zone_feat != "None":
-            zone_val = st.selectbox("Value", sorted([v for v in df_fast_all[zone_feat].dropna().unique().tolist()]))
-            zones = [(zone_feat, zone_val)]
-
-    plot_price(
-        df_fast_all,
-        title=f"{symbol} — FAST events (side={side}) as vertical lines",
-        show_bb=show_bb,
-        show_ema200=show_ema,
-        vlines=vlines,
-        zones=zones,
-    )
-
-    # Occurrence table (lightweight)
-    if combo_n:
-        st.subheader("FAST occurrences (event days)")
-        show_cols = ["Date", "ext_dir", "y_revert"] + [c for c in FAST_FEATURES if c in combo_events.columns]
-        st.dataframe(combo_events.sort_values("Date", ascending=False)[show_cols], use_container_width=True, height=320)
-
-    # Discovery (single-feature edge table) with explanation
-    st.subheader("FAST discovery: which single placements improve reversion odds?")
+    # -------- Occurrence charts (placement periods) --------
+    st.subheader("FAST occurrence charts (each placement-period as a separate collapsible chart)")
     st.markdown(
         """
-**How to read this table**
-- **P(revert|value)**: success rate when that placement is true (within the chosen side U/D).
-- **Lift (pp)**: *(P(revert|value) − baseline)* in percentage-points.
-- **n_events**: sample size; small n is often unstable. Use the min-events slider to filter.
+This section is **not** one chart with points.  
+It creates **one chart per period** where your selected placement combo is continuously active (e.g., “Mars in Virgo” is a multi-day zone).
+Inside each period-chart, Level-1 **event starts** are shown as vertical lines (green=win, red=loss) for the chosen side.
 """
     )
-    disc_fast = discovery_table_fast(events_side, min_n=min_n_events)
-    if disc_fast.empty:
+
+    if not fast_combo:
+        st.info("Select at least one placement in the FAST combo builder to generate occurrence charts.")
+    else:
+        # Build periods from full daily data
+        mask_full = match_combo(df_fast_all, fast_combo)
+        blocks = contiguous_blocks(mask_full)
+
+        if len(blocks) == 0:
+            st.info("No historical placement periods found for this combo.")
+        else:
+            # Prefer showing most recent occurrences first
+            block_ranges = []
+            for a, b in blocks:
+                block_ranges.append((df_fast_all.loc[a, "Date"], df_fast_all.loc[b, "Date"], a, b))
+            block_ranges.sort(key=lambda x: x[0], reverse=True)
+
+            shown = 0
+            for start_d, end_d, a, b in block_ranges:
+                if shown >= max_occ_charts:
+                    break
+
+                df_slice = df_fast_all.iloc[a:b+1].copy()
+
+                # Event lines inside the period, only for chosen side
+                vlines = []
+                ev_slice = combo_events[(combo_events["Date"] >= start_d) & (combo_events["Date"] <= end_d)].copy()
+                if len(ev_slice):
+                    for _, r in ev_slice.iterrows():
+                        vlines.append({"date": r["Date"], "outcome": int(r["y_revert"])})
+
+                # Title
+                title = f"{start_d} → {end_d}  |  days={len(df_slice)}  |  {side}-events in period={len(ev_slice)}"
+
+                with st.expander(title, expanded=(shown < 3)):
+                    plot_slice(
+                        df_slice,
+                        title=title,
+                        show_bb=show_bb,
+                        show_ema200=False,
+                        vlines=vlines,
+                    )
+
+                shown += 1
+
+    # -------- Discovery table (single-feature) --------
+    st.subheader("FAST discovery: single placements ranked by lift (pp)")
+    st.markdown(
+        """
+**How to read**
+- **P(revert|value)** = success rate on event days when that placement is active (for your chosen side U/D).
+- **Lift (pp)** = P(revert|value) − baseline, in percentage-points.
+- Filter by min events (n) to enforce stability.
+"""
+    )
+    if disc_fast is None or len(disc_fast) == 0:
         st.info("No FAST single-feature signals meet the minimum event count.")
     else:
         df_show = disc_fast.copy()
-        df_show["P(revert|value)"] = df_show["P(revert|value)"].map(lambda x: round(float(x)*100, 1))
+        df_show["P(revert|value)"] = df_show["P(revert|value)"].map(lambda x: round(float(x) * 100, 1))
         df_show["Lift_vs_baseline_pp"] = df_show["Lift_vs_baseline_pp"].map(lambda x: round(float(x), 1))
         st.dataframe(df_show, use_container_width=True, height=420)
 
 # ============================================================
-# TAB 2: SLOW (daily trend vs EMA200)
+# TAB 2: SLOW (trend vs EMA200)
 # ============================================================
 with tabs[1]:
     st.subheader("SLOW: Trend Edge using EMA200 Regime (Jupiter/Saturn/Rahu/Ketu)")
-
     st.markdown(
         """
-**What is measured here (SLOW planets)?**
-- Every trading day is labeled **UP** if Close ≥ EMA200, else **DOWN**.
-- This measures: **“When a slow-planet placement is active, is the market more likely to be in an UP regime?”**
-- This is intentionally **trend-based**, not reversal-based.
+**Meaning**
+- Every day is labeled **UP** if Close ≥ EMA200 else **DOWN**.
+- We measure whether a slow-planet placement biases the market toward the UP regime.
+- This is **trend-based**, not reversal-based.
 """
     )
 
-    base_up = float(df_slow_all["is_uptrend"].mean())
+    base_up, lk_slow, disc_slow = lift_lookup_slow(df_slow_all, min_n_days=min_n_days)
     base_dn = float(df_slow_all["is_downtrend"].mean())
     base_days = int(len(df_slow_all))
 
-    # SLOW combo builder (Jup/Sat/Rahu/Ketu)
-    with st.expander("SLOW combo builder (optional)", expanded=True):
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
+    # Slow combo builder
+    with st.expander("SLOW combo builder (placements)", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
             jup_signs = st.multiselect("Jupiter sign", SIGNS, default=[])
-        with col2:
+        with c2:
             sat_signs = st.multiselect("Saturn sign", SIGNS, default=[])
-        with col3:
+        with c3:
             rahu_signs = st.multiselect("Rahu sign", SIGNS, default=[])
-        with col4:
+        with c4:
             ketu_signs = st.multiselect("Ketu sign", SIGNS, default=[])
 
-        col5, col6, col7 = st.columns(3)
-        with col5:
+        c5, c6, c7 = st.columns(3)
+        with c5:
             jup_retro = st.selectbox("Jupiter retro", ["Any", "True", "False"], index=0)
-        with col6:
+        with c6:
             sat_retro = st.selectbox("Saturn retro", ["Any", "True", "False"], index=0)
-        with col7:
+        with c7:
             js_aspect = st.multiselect("Jupiter–Saturn aspect", ["CONJUNCTION", "OPPOSITION", "NONE"], default=[])
 
-        slow_combo = {}
-        if jup_signs: slow_combo["Jupiter_sign"] = jup_signs
-        if sat_signs: slow_combo["Saturn_sign"] = sat_signs
-        if rahu_signs: slow_combo["Rahu_sign"] = rahu_signs
-        if ketu_signs: slow_combo["Ketu_sign"] = ketu_signs
-        if js_aspect: slow_combo["JS_aspect"] = js_aspect
-        if jup_retro != "Any":
-            slow_combo["Jupiter_retro"] = (jup_retro == "True")
-        if sat_retro != "Any":
-            slow_combo["Saturn_retro"] = (sat_retro == "True")
+    slow_combo = {}
+    if jup_signs: slow_combo["Jupiter_sign"] = jup_signs
+    if sat_signs: slow_combo["Saturn_sign"] = sat_signs
+    if rahu_signs: slow_combo["Rahu_sign"] = rahu_signs
+    if ketu_signs: slow_combo["Ketu_sign"] = ketu_signs
+    if js_aspect: slow_combo["JS_aspect"] = js_aspect
+    if jup_retro != "Any":
+        slow_combo["Jupiter_retro"] = (jup_retro == "True")
+    if sat_retro != "Any":
+        slow_combo["Saturn_retro"] = (sat_retro == "True")
 
+    # Metrics on daily regime
     if slow_combo:
-        m = match_combo(df_slow_all, slow_combo)
-        slow_sub = df_slow_all[m].copy()
+        m_day = match_combo(df_slow_all, slow_combo)
+        slow_sub = df_slow_all[m_day].copy()
     else:
         slow_sub = df_slow_all.copy()
 
@@ -742,40 +767,131 @@ with tabs[1]:
     k3.metric("Lift in P(UP)", safe_pp(lift_up_pp))
     k4.metric("Combo n (days)", f"{n_days}")
 
-    # SLOW chart: show EMA200 and shade placement zones (most useful here)
-    zones = []
-    with st.expander("SLOW chart zones (recommended)", expanded=True):
-        zone_feat = st.selectbox("Shade where", ["None"] + SLOW_FEATURES, index=0)
-        zone_val = None
-        if zone_feat != "None":
-            zone_val = st.selectbox("Value", sorted([v for v in df_slow_all[zone_feat].dropna().unique().tolist()]))
-            zones = [(zone_feat, zone_val)]
-
-    plot_price(
-        df_slow_all,
-        title=f"{symbol} — SLOW regimes (EMA200) with shaded zones",
-        show_bb=False,
-        show_ema200=show_ema,
-        vlines=[],
-        zones=zones,
-    )
-
-    # Discovery for slow planets (single feature)
-    st.subheader("SLOW discovery: which placements shift EMA200 trend odds?")
+    # -------- Occurrence charts (placement periods) --------
+    st.subheader("SLOW occurrence charts (each placement-period as a separate collapsible chart)")
     st.markdown(
         """
-**How to read this table**
-- **P(UP|value)**: fraction of days the market is above EMA200 while that placement is active.
-- **Lift_UP (pp)**: *(P(UP|value) − baseline P(UP))* in percentage-points.
-- **n_days**: sample size; require large n for stability (use min-days slider).
+Each chart is **one continuous period** where your slow-planet combo is active (e.g., “Jupiter in Aries” is a long zone).
+The chart is restricted to that period so price auto-scales to the relevant move.
 """
     )
-    disc_slow = discovery_table_slow(df_slow_all, min_n=min_n_days)
-    if disc_slow.empty:
+
+    if not slow_combo:
+        st.info("Select at least one placement in the SLOW combo builder to generate occurrence charts.")
+    else:
+        mask_full = match_combo(df_slow_all, slow_combo)
+        blocks = contiguous_blocks(mask_full)
+
+        if len(blocks) == 0:
+            st.info("No historical placement periods found for this combo.")
+        else:
+            block_ranges = []
+            for a, b in blocks:
+                block_ranges.append((df_slow_all.loc[a, "Date"], df_slow_all.loc[b, "Date"], a, b))
+            block_ranges.sort(key=lambda x: x[0], reverse=True)
+
+            shown = 0
+            for start_d, end_d, a, b in block_ranges:
+                if shown >= max_occ_charts:
+                    break
+
+                df_slice = df_slow_all.iloc[a:b+1].copy()
+                title = f"{start_d} → {end_d}  |  days={len(df_slice)}  |  P(UP) in period={df_slice['is_uptrend'].mean()*100:.1f}%"
+
+                with st.expander(title, expanded=(shown < 3)):
+                    plot_slice(
+                        df_slice,
+                        title=title,
+                        show_bb=False,
+                        show_ema200=show_ema,
+                        vlines=None,
+                    )
+
+                shown += 1
+
+    # -------- Discovery table (single-feature) --------
+    st.subheader("SLOW discovery: single placements ranked by UP-regime lift (pp)")
+    st.markdown(
+        """
+**How to read**
+- **P(UP|value)** = fraction of days above EMA200 while that placement is active.
+- **Lift (pp)** = P(UP|value) − baseline P(UP), in percentage-points.
+- Use min-days threshold to reduce instability.
+"""
+    )
+    if disc_slow is None or len(disc_slow) == 0:
         st.info("No SLOW single-feature signals meet the minimum day count.")
     else:
         df_show = disc_slow.copy()
-        df_show["P(UP|value)"] = df_show["P(UP|value)"].map(lambda x: round(float(x)*100, 1))
-        df_show["P(DOWN|value)"] = df_show["P(DOWN|value)"].map(lambda x: round(float(x)*100, 1))
+        df_show["P(UP|value)"] = df_show["P(UP|value)"].map(lambda x: round(float(x) * 100, 1))
+        df_show["P(DOWN|value)"] = df_show["P(DOWN|value)"].map(lambda x: round(float(x) * 100, 1))
         df_show["Lift_UP_vs_baseline_pp"] = df_show["Lift_UP_vs_baseline_pp"].map(lambda x: round(float(x), 1))
         st.dataframe(df_show, use_container_width=True, height=440)
+
+# ============================================================
+# TAB 3: Future Force (timeseries of lifts for upcoming transits)
+# ============================================================
+with tabs[2]:
+    st.subheader("Future Force: Lift Timeseries (next N days)")
+    st.markdown(
+        """
+This computes upcoming sidereal placements and maps them to **historical lifts**:
+- FAST: uses **event-side** baseline/lifts (U or D) from Level-1 events.
+- SLOW: uses **EMA200 regime** baseline/lifts for UP probability.
+The output is a timeseries showing how each placement’s lift changes over the forecast window.
+"""
+    )
+
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        future_days = st.selectbox("Forecast window (days)", [30, 60, 90, 120, 180], index=0)
+    with col2:
+        future_mode = st.selectbox("Mode", ["FAST (reversion lifts)", "SLOW (trend lifts)"], index=0)
+    with col3:
+        st.markdown('<div class="smallmuted">The “Total Force” line is baseline plus the sum of the per-feature lifts (pp) available for that day. This is a practical aggregator for scanning.</div>', unsafe_allow_html=True)
+
+    start = datetime.now(tz=UTC).date()
+    future_dates = [start + timedelta(days=i) for i in range(1, int(future_days) + 1)]
+    df_future = compute_astro(future_dates)
+
+    if df_future.empty:
+        st.info("No future astro data returned.")
+        st.stop()
+
+    if future_mode.startswith("FAST"):
+        # Need side selection + historical lift lookup from current app settings
+        side_ff = st.radio("FAST side for lift mapping", ["U", "D"], horizontal=True, key="future_fast_side")
+        events_side = events[(events["ext_dir"] == side_ff) & pd.notna(events["y_revert"])].copy()
+        if len(events_side) == 0:
+            st.info("No labeled events available for this side under current settings.")
+            st.stop()
+
+        base_fast, lk_fast, _ = lift_lookup_fast(events_side, min_n_events=min_n_events)
+
+        # Feature list for timeseries (exclude Moon_sign by default because it is extremely noisy)
+        include_moon = st.checkbox("Include Moon_sign line (very noisy)", value=False)
+        ff_features = ["Mercury_sign", "Venus_sign", "Mars_sign", "Phase", "Mercury_retro", "Moon_Node", "Rahu_sign", "Ketu_sign"]
+        if include_moon:
+            ff_features = ["Moon_sign"] + ff_features
+
+        plot_future_lifts(
+            df_future=df_future,
+            base_prob=base_fast,
+            lk=lk_fast,
+            feature_list=ff_features,
+            title_prefix=f"FAST Future Force (side={side_ff}) — {symbol}",
+            prob_label="P(revert)",
+        )
+
+    else:
+        base_up, lk_slow, _ = lift_lookup_slow(df_slow_all, min_n_days=min_n_days)
+        sf_features = ["Jupiter_sign", "Saturn_sign", "Rahu_sign", "Ketu_sign", "Jupiter_retro", "Saturn_retro", "JS_aspect"]
+
+        plot_future_lifts(
+            df_future=df_future,
+            base_prob=base_up,
+            lk=lk_slow,
+            feature_list=sf_features,
+            title_prefix=f"SLOW Future Force (EMA200 UP bias) — {symbol}",
+            prob_label="P(UP)",
+        )
