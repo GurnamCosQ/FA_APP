@@ -3,4 +3,4 @@ yfinance
 plotly
 pandas
 numpy
-pyswisseph==2.10.03.2
+swisseph
