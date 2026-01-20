@@ -332,10 +332,7 @@ def create_main_chart(df: pd.DataFrame, hit_dates: list, side: str, symbol: str,
                     x1=zone_end,
                     fillcolor="rgba(255, 215, 0, 0.15)",
                     layer="below",
-                    line_width=0,
-                    annotation_text=f"{zone_feat.replace('_sign', '')}: {zone_sign}",
-                    annotation_position="top left",
-                    annotation=dict(font_size=10, font_color="rgba(255, 165, 0, 0.8)")
+                    line_width=0
                 )
                 in_zone = False
         
@@ -359,9 +356,7 @@ def create_main_chart(df: pd.DataFrame, hit_dates: list, side: str, symbol: str,
                 x=str(row["Date"]),
                 line_width=2,
                 line_dash="solid",
-                line_color=color,
-                annotation_text=row["ext_dir"],
-                annotation_position="top"
+                line_color=color
             )
     
     # Mark combo hit dates with distinct vertical lines
@@ -370,10 +365,7 @@ def create_main_chart(df: pd.DataFrame, hit_dates: list, side: str, symbol: str,
             x=str(d),
             line_width=3,
             line_dash="dash",
-            line_color="rgba(102, 126, 234, 0.7)",
-            annotation_text="★",
-            annotation_position="top",
-            annotation=dict(font_size=16, font_color="rgba(102, 126, 234, 1)")
+            line_color="rgba(102, 126, 234, 0.7)"
         )
     
     # Update layout for clean appearance
