@@ -253,126 +253,172 @@ def force_score(row: pd.Series, brain: dict, side: str, k_shrink: float = 50.0) 
     return score, breakdown
 
 # -------------------- Enhanced Chart Functions --------------------
-def create_main_chart(df: pd.DataFrame, hit_dates: list, side: str, symbol: str):
-    """Enhanced multi-panel chart with price, volume, force score, and events"""
-    from plotly.subplots import make_subplots
+def create_main_chart(df: pd.DataFrame, hit_dates: list, side: str, symbol: str, zone_feat: str = None, zone_sign: str = None):
+    """Clean price chart with planetary zones and event markers"""
+    fig = go.Figure()
     
-    # Create subplots with minimal parameters
-    fig = make_subplots(rows=4, cols=1)
-    
-    # Panel 1: Candlestick with BB
-    fig.add_trace(go.Candlestick(
+    # Main price line
+    fig.add_trace(go.Scatter(
         x=df["Date"].astype(str),
-        open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
-        name="Price",
-        increasing_line_color='#26a69a',
-        decreasing_line_color='#ef5350'
-    ), row=1, col=1)
-
+        y=df["Close"],
+        mode="lines",
+        name="Close Price",
+        line=dict(color='#2962ff', width=2),
+        hovertemplate='<b>%{x}</b><br>Price: $%{y:.2f}<extra></extra>'
+    ))
+    
+    # Add MA20
     fig.add_trace(go.Scatter(
-        x=df["Date"].astype(str), y=df["MA20"],
-        mode="lines", name="MA20",
-        line=dict(color='#ffa726', width=2)
-    ), row=1, col=1)
-
-    fig.add_trace(go.Scatter(
-        x=df["Date"].astype(str), y=df["UpperThreshold"],
-        mode="lines", name="Upper",
-        line=dict(color='rgba(255,0,0,0.3)', dash='dash'),
-        fill=None
-    ), row=1, col=1)
-
-    fig.add_trace(go.Scatter(
-        x=df["Date"].astype(str), y=df["LowerThreshold"],
-        mode="lines", name="Lower",
-        line=dict(color='rgba(0,255,0,0.3)', dash='dash'),
-        fill='tonexty',
-        fillcolor='rgba(100,100,100,0.1)'
-    ), row=1, col=1)
-
-    # Panel 2: Volume
-    colors = ['#ef5350' if df.loc[i, 'Close'] < df.loc[i, 'Open'] else '#26a69a' for i in df.index]
-    fig.add_trace(go.Bar(
-        x=df["Date"].astype(str), y=df["Volume"],
-        name="Volume",
-        marker_color=colors,
-        showlegend=False
-    ), row=2, col=1)
-
-    # Panel 3: Force Score Timeline (if available)
-    if 'force_score' in df.columns:
+        x=df["Date"].astype(str),
+        y=df["MA20"],
+        mode="lines",
+        name="MA20",
+        line=dict(color='#ff6d00', width=1.5, dash='dash'),
+        hovertemplate='<b>%{x}</b><br>MA20: $%{y:.2f}<extra></extra>'
+    ))
+    
+    # Add EMA200 if available
+    if 'ema200' in df.columns:
         fig.add_trace(go.Scatter(
-            x=df["Date"].astype(str), y=df["force_score"],
-            mode="lines+markers",
-            name="Force Score",
-            line=dict(color='#667eea', width=2),
-            marker=dict(size=4)
-        ), row=3, col=1)
+            x=df["Date"].astype(str),
+            y=df["ema200"],
+            mode="lines",
+            name="EMA200",
+            line=dict(color='#aa00ff', width=1, dash='dot'),
+            opacity=0.6,
+            hovertemplate='<b>%{x}</b><br>EMA200: $%{y:.2f}<extra></extra>'
+        ))
+    
+    # Add Bollinger Bands as filled area
+    fig.add_trace(go.Scatter(
+        x=df["Date"].astype(str),
+        y=df["UpperThreshold"],
+        mode="lines",
+        name="Upper BB",
+        line=dict(width=0),
+        showlegend=False,
+        hoverinfo='skip'
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=df["Date"].astype(str),
+        y=df["LowerThreshold"],
+        mode="lines",
+        name="BB Bands",
+        line=dict(width=0),
+        fillcolor='rgba(68, 138, 255, 0.1)',
+        fill='tonexty',
+        hoverinfo='skip'
+    ))
+    
+    # Add shaded zones for planetary placements (start to end of placement)
+    if zone_feat and zone_sign and zone_feat in df.columns:
+        in_zone = False
+        zone_start = None
         
-        # Add baseline reference
-        if 'baseline' in df.columns:
-            fig.add_trace(go.Scatter(
-                x=df["Date"].astype(str), y=df["baseline"],
-                mode="lines",
-                name="Baseline",
-                line=dict(color='gray', dash='dot', width=1)
-            ), row=3, col=1)
-
-    # Panel 4: Event markers
+        for i in range(len(df)):
+            current_sign = df.iloc[i][zone_feat]
+            
+            # Entering the zone
+            if current_sign == zone_sign and not in_zone:
+                zone_start = str(df.iloc[i]["Date"])
+                in_zone = True
+            
+            # Exiting the zone
+            elif current_sign != zone_sign and in_zone:
+                zone_end = str(df.iloc[i-1]["Date"])
+                fig.add_vrect(
+                    x0=zone_start,
+                    x1=zone_end,
+                    fillcolor="rgba(255, 215, 0, 0.15)",
+                    layer="below",
+                    line_width=0,
+                    annotation_text=f"{zone_feat.replace('_sign', '')}: {zone_sign}",
+                    annotation_position="top left",
+                    annotation=dict(font_size=10, font_color="rgba(255, 165, 0, 0.8)")
+                )
+                in_zone = False
+        
+        # Close any open zone at the end
+        if in_zone and zone_start:
+            zone_end = str(df.iloc[-1]["Date"])
+            fig.add_vrect(
+                x0=zone_start,
+                x1=zone_end,
+                fillcolor="rgba(255, 215, 0, 0.15)",
+                layer="below",
+                line_width=0
+            )
+    
+    # Mark event start dates with vertical lines
     event_df = df[df["event_start"] == True].copy()
     if len(event_df):
-        up_events = event_df[event_df["ext_dir"] == "U"]
-        down_events = event_df[event_df["ext_dir"] == "D"]
-        
-        fig.add_trace(go.Scatter(
-            x=up_events["Date"].astype(str),
-            y=[1] * len(up_events),
-            mode="markers",
-            name="Upper Events",
-            marker=dict(symbol='triangle-up', size=10, color='red')
-        ), row=4, col=1)
-        
-        fig.add_trace(go.Scatter(
-            x=down_events["Date"].astype(str),
-            y=[0] * len(down_events),
-            mode="markers",
-            name="Lower Events",
-            marker=dict(symbol='triangle-down', size=10, color='green')
-        ), row=4, col=1)
-
-    # Add combo hit vertical lines across all subplots
+        for _, row in event_df.iterrows():
+            color = "rgba(239, 83, 80, 0.4)" if row["ext_dir"] == "U" else "rgba(38, 166, 154, 0.4)"
+            fig.add_vline(
+                x=str(row["Date"]),
+                line_width=2,
+                line_dash="solid",
+                line_color=color,
+                annotation_text=row["ext_dir"],
+                annotation_position="top"
+            )
+    
+    # Mark combo hit dates with distinct vertical lines
     for d in hit_dates:
-        fig.add_vline(x=str(d), line_width=2, line_dash="dash", 
-                     line_color="rgba(102, 126, 234, 0.5)")
-
-    # Update layout
+        fig.add_vline(
+            x=str(d),
+            line_width=3,
+            line_dash="dash",
+            line_color="rgba(102, 126, 234, 0.7)",
+            annotation_text="★",
+            annotation_position="top",
+            annotation=dict(font_size=16, font_color="rgba(102, 126, 234, 1)")
+        )
+    
+    # Update layout for clean appearance
     fig.update_layout(
-        title=dict(text=f"{symbol} - Planetary Force Analysis ({side} Side)", font=dict(size=20)),
-        height=1000,
+        title=dict(
+            text=f"{symbol} Price Chart - {side} Side Analysis",
+            font=dict(size=24, color='#1a1a1a'),
+            x=0.5,
+            xanchor='center'
+        ),
+        xaxis_title="Date",
+        yaxis_title="Price ($)",
+        height=700,
         hovermode='x unified',
         showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        plot_bgcolor='#f8f9fa',
-        paper_bgcolor='white'
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            bgcolor="rgba(255, 255, 255, 0.8)",
+            bordercolor="rgba(0, 0, 0, 0.2)",
+            borderwidth=1
+        ),
+        plot_bgcolor='white',
+        paper_bgcolor='white',
+        xaxis=dict(
+            showgrid=True,
+            gridwidth=1,
+            gridcolor='rgba(200, 200, 200, 0.3)',
+            showline=True,
+            linewidth=1,
+            linecolor='rgba(0, 0, 0, 0.3)'
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridwidth=1,
+            gridcolor='rgba(200, 200, 200, 0.3)',
+            showline=True,
+            linewidth=1,
+            linecolor='rgba(0, 0, 0, 0.3)'
+        )
     )
     
-    # Add subplot titles as annotations
-    fig.add_annotation(text="Price & Bollinger Bands", xref="paper", yref="paper",
-                      x=0.5, y=0.98, showarrow=False, font=dict(size=12, color="gray"))
-    fig.add_annotation(text="Volume", xref="paper", yref="paper",
-                      x=0.5, y=0.73, showarrow=False, font=dict(size=12, color="gray"))
-    fig.add_annotation(text="Force Score Timeline", xref="paper", yref="paper",
-                      x=0.5, y=0.48, showarrow=False, font=dict(size=12, color="gray"))
-    fig.add_annotation(text="Event Distribution", xref="paper", yref="paper",
-                      x=0.5, y=0.23, showarrow=False, font=dict(size=12, color="gray"))
-
-    # Update axes
-    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(0,0,0,0.1)')
-    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(0,0,0,0.1)')
-    
-    # Hide range slider
-    fig.update_xaxes(rangeslider_visible=False, row=1, col=1)
-
     return fig
 
 def create_force_breakdown_chart(breakdown: list):
@@ -493,6 +539,17 @@ with st.sidebar:
     with st.expander("🔮 Future Scan"):
         future_days = st.slider("Scan days ahead", 7, 90, 30)
         top_k = st.slider("Show top dates", 3, 20, 5)
+    
+    with st.expander("🎨 Chart Overlay"):
+        st.caption("Highlight planetary placement zones on chart")
+        zone_feat = st.selectbox(
+            "Show planet-in-sign zone",
+            ["None", "Mars_sign", "Mercury_sign", "Venus_sign", "Moon_sign", "Jupiter_sign", "Saturn_sign", "Rahu_sign", "Ketu_sign"],
+            index=0
+        )
+        zone_sign = None
+        if zone_feat != "None":
+            zone_sign = st.selectbox("Which sign to highlight", SIGNS, index=0)
 
 # -------------------- Build pipeline --------------------
 with st.spinner("Loading data..."):
@@ -596,11 +653,24 @@ with col5:
 
 # -------------------- Main Chart --------------------
 st.markdown("---")
-st.markdown("### 📈 Price & Force Analysis")
+st.markdown("### 📈 Price Chart with Planetary Zones")
 
+zone_feat_resolved = None if zone_feat == "None" else zone_feat
 hit_dates = occ["Date"].tolist() if len(occ) else []
-main_chart = create_main_chart(df_all, hit_dates, side, symbol)
+main_chart = create_main_chart(df_all, hit_dates, side, symbol, zone_feat_resolved, zone_sign)
 st.plotly_chart(main_chart, use_container_width=True)
+
+# Add legend explanation
+st.caption("""
+**Chart Legend:**
+- 📊 **Blue Line**: Close price
+- 🟠 **Orange Dashed**: MA20 (moving average)
+- 🟣 **Purple Dotted**: EMA200 (trend indicator)
+- 🔴 **Red Vertical Lines**: Upper (U) extreme events
+- 🟢 **Green Vertical Lines**: Lower (D) extreme events  
+- ⭐ **Blue Starred Lines**: Combo filter matches
+- 🟡 **Yellow Zones**: Selected planetary placement periods
+""")
 
 # -------------------- Force Breakdown & Performance --------------------
 st.markdown("---")
