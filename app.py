@@ -259,12 +259,11 @@ def create_main_chart(df: pd.DataFrame, hit_dates: list, side: str, symbol: str)
         rows=4, cols=1,
         shared_xaxis=True,
         vertical_spacing=0.03,
-        subplot_titles=('Price & Bollinger Bands', 'Volume', 'Force Score Timeline', 'Event Distribution'),
         row_heights=[0.5, 0.15, 0.20, 0.15],
-        specs=[[{"secondary_y": False}],
-               [{"secondary_y": False}],
-               [{"secondary_y": False}],
-               [{"secondary_y": False}]]
+        specs=[[{"type": "candlestick"}],
+               [{"type": "bar"}],
+               [{"type": "scatter"}],
+               [{"type": "scatter"}]]
     )
 
     # Panel 1: Candlestick with BB
@@ -362,6 +361,16 @@ def create_main_chart(df: pd.DataFrame, hit_dates: list, side: str, symbol: str)
         plot_bgcolor='#f8f9fa',
         paper_bgcolor='white'
     )
+    
+    # Add subplot titles as annotations
+    fig.add_annotation(text="Price & Bollinger Bands", xref="paper", yref="paper",
+                      x=0.5, y=0.98, showarrow=False, font=dict(size=12, color="gray"))
+    fig.add_annotation(text="Volume", xref="paper", yref="paper",
+                      x=0.5, y=0.63, showarrow=False, font=dict(size=12, color="gray"))
+    fig.add_annotation(text="Force Score Timeline", xref="paper", yref="paper",
+                      x=0.5, y=0.38, showarrow=False, font=dict(size=12, color="gray"))
+    fig.add_annotation(text="Event Distribution", xref="paper", yref="paper",
+                      x=0.5, y=0.13, showarrow=False, font=dict(size=12, color="gray"))
 
     fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(0,0,0,0.1)')
     fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(0,0,0,0.1)')
