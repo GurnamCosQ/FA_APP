@@ -255,12 +255,11 @@ def force_score(row: pd.Series, brain: dict, side: str, k_shrink: float = 50.0) 
 # -------------------- Enhanced Chart Functions --------------------
 def create_main_chart(df: pd.DataFrame, hit_dates: list, side: str, symbol: str):
     """Enhanced multi-panel chart with price, volume, force score, and events"""
-    fig = make_subplots(
-        rows=4, cols=1,
-        shared_xaxis=True,
-        vertical_spacing=0.05
-    )
-
+    from plotly.subplots import make_subplots
+    
+    # Create subplots with minimal parameters
+    fig = make_subplots(rows=4, cols=1)
+    
     # Panel 1: Candlestick with BB
     fig.add_trace(go.Candlestick(
         x=df["Date"].astype(str),
@@ -341,18 +340,18 @@ def create_main_chart(df: pd.DataFrame, hit_dates: list, side: str, symbol: str)
             marker=dict(symbol='triangle-down', size=10, color='green')
         ), row=4, col=1)
 
-    # Add combo hit vertical lines
+    # Add combo hit vertical lines across all subplots
     for d in hit_dates:
         fig.add_vline(x=str(d), line_width=2, line_dash="dash", 
                      line_color="rgba(102, 126, 234, 0.5)")
 
+    # Update layout
     fig.update_layout(
         title=dict(text=f"{symbol} - Planetary Force Analysis ({side} Side)", font=dict(size=20)),
         height=1000,
         hovermode='x unified',
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        xaxis_rangeslider_visible=False,
         plot_bgcolor='#f8f9fa',
         paper_bgcolor='white'
     )
@@ -361,14 +360,18 @@ def create_main_chart(df: pd.DataFrame, hit_dates: list, side: str, symbol: str)
     fig.add_annotation(text="Price & Bollinger Bands", xref="paper", yref="paper",
                       x=0.5, y=0.98, showarrow=False, font=dict(size=12, color="gray"))
     fig.add_annotation(text="Volume", xref="paper", yref="paper",
-                      x=0.5, y=0.63, showarrow=False, font=dict(size=12, color="gray"))
+                      x=0.5, y=0.73, showarrow=False, font=dict(size=12, color="gray"))
     fig.add_annotation(text="Force Score Timeline", xref="paper", yref="paper",
-                      x=0.5, y=0.38, showarrow=False, font=dict(size=12, color="gray"))
+                      x=0.5, y=0.48, showarrow=False, font=dict(size=12, color="gray"))
     fig.add_annotation(text="Event Distribution", xref="paper", yref="paper",
-                      x=0.5, y=0.13, showarrow=False, font=dict(size=12, color="gray"))
+                      x=0.5, y=0.23, showarrow=False, font=dict(size=12, color="gray"))
 
+    # Update axes
     fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(0,0,0,0.1)')
     fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(0,0,0,0.1)')
+    
+    # Hide range slider
+    fig.update_xaxes(rangeslider_visible=False, row=1, col=1)
 
     return fig
 
